@@ -1,2 +1,176 @@
-# MultiSmolVLA
-Enhancing Multimodality in SmolVLA model to make it robust to multiple perceptual sensors
+# Sensor-Robust Multimodal VLA via Modality-Dropout Adapter Training on SmolVLA
+
+**CS-503 Visual Intelligence — EPFL, 2026**
+
+*Alix Papadatos · Florian Tanguy · Mario Fernández · Tomas Garate Anderegg*
+
+---
+
+## Overview
+
+State-of-the-art Vision-Language-Action (VLA) models rely mostly on RGB perception and suffer catastrophic performance degradation under sensor failure. We propose a training strategy that mitigates this dependence by replacing SmolVLA's SigLIP encoder with the frozen **4M-21** multimodal encoder, adding a lightweight **MLP connector**, and training under a **modality-dropout curriculum** to build robustness to sensor failures and full modality dropout.
+
+---
+
+## Pipeline
+
+![Pipeline](assets/pipeline.png)
+
+*Block 1 (Perception): Four input modalities (RGB, depth, segmentation, thermal) pass through a modality-dropout layer during training. Thermal is synthesized from RGB via ThermalGen and embedded through ImageBind into a format natively supported by 4M-21. The frozen 4M-21 encoder fuses all available modalities into a unified token sequence.*
+
+*Block 2 (Action): Multimodal tokens are projected into SmolLM2's embedding space via a MLP connector. SmolLM2, concatenated with text and robot state tokens, conditions the action expert to generate continuous action chunks.*
+
+---
+
+## Method
+
+### Architecture
+
+| Component | Role | Frozen? |
+|---|---|---|
+| ImageBind | Thermal → embedding compatible with 4M-21 | ✅ |
+| 4M-21 encoder | Fuses RGB + depth + seg + thermal → token sequence | ✅ |
+| MLP connector | Projects 4M tokens → SmolLM2 token space | ❌ (Stage 1) |
+| SmolLM2 | Language decoder, conditions action expert | ❌ (Stage 2, LoRA) |
+| Action expert | Generates continuous action chunks | ❌ (Stage 2, LoRA) |
+
+### Training Strategy
+
+**Stage 1 — Connector alignment:** Train only the MLP connector to align 4M-21 features with SmolLM2's expected token distribution. All other components frozen.
+
+**Stage 2 — Robustness fine-tuning:** Fine-tune the full model with LoRA adapters under a modality-dropout curriculum. Each modality is independently zeroed out with probability $p_{\text{drop}}$, increasing linearly from 0 to 0.5 over training.
+
+### Modality Dropout
+
+During training, each modality is independently zeroed out before being passed to 4M-21. This forces the model to learn to fuse all modalities when available, and to compensate for missing ones progressively.
+
+---
+
+## Dataset
+
+We use the [`binhng/original-libero`](https://huggingface.co/datasets/binhng/original-libero) curated dataset on HuggingFace, derived from the [LIBERO benchmark](https://libero-project.github.io/), which provides aligned RGB, semantic segmentation, and depth map modalities. Thermal representations are synthetically generated from RGB using [ThermalGen](https://openreview.net/forum?id=o0JSYq1TQ4).
+
+---
+
+## Evaluation
+
+We evaluate on the four LIBERO task suites: **Spatial**, **Object**, **Goal**, **Long**.
+
+| Condition | Description |
+|---|---|
+| Clean | All modalities available, no corruption |
+| Hard dropout | One or more modalities zeroed at inference time |
+| Soft corruption | Gaussian noise, motion blur, centered black-square occlusion |
+
+**Baselines:**
+- Vanilla SmolVLA (RGB only, no dropout training): 87.3% avg task completion
+- Vanilla π0 (RGB only, no dropout training): 86% avg task completion
+
+**Ablations:**
+- (a) w/ vs. w/o additional modalities
+- (b) Fixed dropout vs. curriculum dropout schedule
+
+---
+
+## Project Structure
+
+```
+vla-robustness/
+├── src/
+│   ├── pipeline/
+│   │   ├── __init__.py
+│   │   ├── encoder_4m.py        # 4M-21 encoder wrapper
+│   │   ├── connector.py         # MLP connector (LLaVA-1.5 style)
+│   │   ├── smolvla_wrapper.py   # SmolVLA wrapper
+│   │   └── full_pipeline.py     # End-to-end pipeline
+│   └── utils/
+│       ├── __init__.py
+│       └── debug.py
+├── scripts/
+│   └── test_pipeline.py         # End-to-end sanity check
+├── notebooks/                   # Debug & visualization
+├── data/                        # LIBERO dataset (not tracked)
+├── models/                      # Checkpoints (not tracked)
+├── third_party/                 # Source deps (not tracked)
+│   ├── lerobot/
+│   ├── ml-4m/
+│   └── ImageBind/
+├── assets/
+│   └── pipeline.png             # Pipeline figure
+├── requirements.txt
+└── README.md
+```
+
+---
+
+## Setup
+
+### 1. Create environment
+
+```bash
+conda create -n vla python=3.12 -y
+conda activate vla
+```
+
+### 2. Install PyTorch (CUDA)
+
+```bash
+pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 torchaudio==2.7.0+cu128 \
+    --index-url https://download.pytorch.org/whl/cu128
+```
+
+### 3. Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### 4. Install source dependencies
+
+```bash
+# LeRobot (SmolVLA)
+git clone https://github.com/huggingface/lerobot.git third_party/lerobot
+cd third_party/lerobot && git checkout -b vla_custom && pip install -e . && cd ../..
+
+# 4M-21
+git clone https://github.com/apple/ml-4m.git third_party/ml-4m
+pip install --no-deps -e third_party/ml-4m
+
+# ImageBind
+git clone https://github.com/facebookresearch/ImageBind.git third_party/ImageBind
+pip install --no-deps -e third_party/ImageBind
+pip install pytorchvideo types-regex
+```
+
+> ⚠️ **Windows fix for pytorchvideo:** In `site-packages/pytorchvideo/transforms/augmentations.py`, replace `import torchvision.transforms.functional_tensor as F_t` with `import torchvision.transforms.functional as F_t`.
+
+### 5. Run sanity check
+
+```bash
+python scripts/test_pipeline.py
+```
+
+---
+
+## Dependencies
+
+| Package | Version | Notes |
+|---|---|---|
+| Python | 3.12 | Required by LeRobot 0.5.2+ |
+| PyTorch | 2.7.0+cu128 | Required by LeRobot 0.5.2+ |
+| LeRobot | 0.5.2 | Contains SmolVLA |
+| fourm | 1.0.0 | 4M-21, installed `--no-deps` |
+| ImageBind | 0.1.0 | Thermal encoder, installed `--no-deps` |
+
+---
+
+## References
+
+1. Fei et al., *LIBERO-Plus: In-depth robustness analysis of VLA models*, arXiv:2510.13626, 2025.
+2. Ma et al., *A survey on VLA models for embodied AI*, arXiv:2405.14093, 2026.
+3. Bachmann et al., *4M-21: An any-to-any vision model*, arXiv:2406.09406, 2024.
+4. Shukor et al., *SmolVLA: A VLA model for affordable and efficient robotics*, arXiv:2506.01844, 2025.
+5. Guo et al., *On robustness of VLA against multi-modal perturbations*, arXiv:2510.00037, 2026.
+6. Xiao et al., *ThermalGen*, NeurIPS 2025.
+7. Girdhar et al., *ImageBind: One embedding space to bind them all*, arXiv:2305.05665, 2023.
+8. Liu et al., *Improved baselines with visual instruction tuning (LLaVA-1.5)*, arXiv:2310.03744, 2024.
