@@ -4,6 +4,9 @@
 
 *Alix Papadatos · Florian Tanguy · Mario Fernández · Tomas Garate Anderegg*
 
+git clone --recurse-submodules <url_de_ton_repo>
+
+
 ---
 
 ## Overview
