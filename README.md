@@ -78,28 +78,33 @@ We evaluate on the four LIBERO task suites: **Spatial**, **Object**, **Goal**, *
 ## Project Structure
 
 ```
-vla-robustness/
+MultiSmolVLA/
 ├── src/
 │   ├── pipeline/
 │   │   ├── __init__.py
-│   │   ├── encoder_4m.py        # 4M-21 encoder wrapper
-│   │   ├── connector.py         # MLP connector (LLaVA-1.5 style)
-│   │   ├── smolvla_wrapper.py   # SmolVLA wrapper
-│   │   └── full_pipeline.py     # End-to-end pipeline
+│   │   ├── encoder_4m.py           # 4M-21 encoder wrapper
+│   │   ├── imagebind_encoder.py    # ImageBind thermal encoder
+│   │   ├── thermalgen_encoder.py   # ThermalGen RGB→thermal
+│   │   ├── modality_dropout.py     # Curriculum modality dropout
+│   │   ├── connector.py            # MLP connector (LLaVA-1.5 style)
+│   │   ├── smolvla_wrapper.py      # SmolVLA wrapper
+│   │   └── full_pipeline.py        # End-to-end pipeline
 │   └── utils/
 │       ├── __init__.py
 │       └── debug.py
 ├── scripts/
-│   └── test_pipeline.py         # End-to-end sanity check
-├── notebooks/                   # Debug & visualization
-├── data/                        # LIBERO dataset (not tracked)
-├── models/                      # Checkpoints (not tracked)
-├── third_party/                 # Source deps (not tracked)
+│   ├── test_pipeline.py            # End-to-end sanity check
+│   └── test_dropout.py             # Test modality dropout seul
+├── notebooks/                      # Debug & visualization
+├── data/                           # LIBERO dataset (not tracked)
+├── models/                         # Checkpoints (not tracked)
+├── third_party/                    # Source deps (not tracked)
 │   ├── lerobot/
 │   ├── ml-4m/
-│   └── ImageBind/
+│   ├── ImageBind/
+│   └── ThermalGen/
 ├── assets/
-│   └── pipeline.png             # Pipeline figure
+│   └── pipeline.png                # Pipeline figure
 ├── requirements.txt
 └── README.md
 ```
