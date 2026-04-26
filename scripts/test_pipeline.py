@@ -3,6 +3,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
+from transformers import AutoTokenizer
 from src.pipeline.full_pipeline import VLAPipeline
 
 
@@ -19,10 +20,13 @@ def main():
         "seg":     torch.randn(B, 1, 224, 224, device=device),
         "thermal": torch.randn(B, 3, 224, 224, device=device),
     }
+
+    task = "pick up the red block\n"
+    tokenized = tokenizer(task, padding="max_length", truncation=True, max_length=48, return_tensors="pt")
     batch = {
-        "observation.images.top": torch.randn(B, 3, 224, 224, device=device),
         "observation.state": torch.randn(B, 7, device=device),
-        "task": ["pick up the red block"],
+        "observation.language.tokens": tokenized["input_ids"].to(device),
+        "observation.language.attention_mask": tokenized["attention_mask"].to(device),
     }
 
     print("--- Forward pass ---")

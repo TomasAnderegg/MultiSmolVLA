@@ -4,7 +4,9 @@
 
 *Alix Papadatos · Florian Tanguy · Mario Fernández · Tomas Garate Anderegg*
 
+```bash
 git clone --recurse-submodules <url_de_ton_repo>
+```
 
 
 ---
@@ -152,10 +154,28 @@ pip install pytorchvideo types-regex
 
 > ⚠️ **Windows fix for pytorchvideo:** In `site-packages/pytorchvideo/transforms/augmentations.py`, replace `import torchvision.transforms.functional_tensor as F_t` with `import torchvision.transforms.functional as F_t`.
 
-### 5. Run sanity check
+### 5. Apply required patch to lerobot
+
+Python 3.12 has a stricter dataclass rule that breaks one file in lerobot. Open `third_party/lerobot/src/lerobot/policies/groot/groot_n1.py` and find the `GR00TN15Config` class (~line 177). Add `default=None` to the four `init=False` fields:
+
+```python
+# Before
+backbone_cfg: dict = field(init=False, metadata={"help": "Backbone configuration."})
+action_head_cfg: dict = field(init=False, metadata={"help": "Action head configuration."})
+action_horizon: int = field(init=False, metadata={"help": "Action horizon."})
+action_dim: int = field(init=False, metadata={"help": "Action dimension."})
+
+# After
+backbone_cfg: dict = field(init=False, default=None, metadata={"help": "Backbone configuration."})
+action_head_cfg: dict = field(init=False, default=None, metadata={"help": "Action head configuration."})
+action_horizon: int = field(init=False, default=None, metadata={"help": "Action horizon."})
+action_dim: int = field(init=False, default=None, metadata={"help": "Action dimension."})
+```
+
+### 6. Run sanity check
 
 ```bash
-python scripts/test_pipeline.py
+python scripts/test_pipeline.py # Full pipeline — requires GPU
 ```
 
 ---
