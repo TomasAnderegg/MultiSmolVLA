@@ -1,9 +1,7 @@
 import torch
 import torch.nn as nn
-from .encoder_4m import Encoder4M
 from .imagebind_encoder import ImageBindThermalEncoder
-from .connector import MLPConnector
-from .smolvla_wrapper import SmolVLAWrapper
+from .smolvla.smolvla_wrapper import SmolVLAWrapper
 
 
 class VLAPipeline(nn.Module):
@@ -13,17 +11,12 @@ class VLAPipeline(nn.Module):
     """
     def __init__(
         self,
-        fourm_checkpoint: str = "apple/4M-21_XL",
-        smolvla_checkpoint: str = "lerobot/smolvla_base",
-        encoder_dim: int = 1024,
-        smolvla_dim: int = 2048,
+        smolvla_checkpoint: str = "lerobot/smolvla_libero",
         device: str = "cuda",
     ):
         super().__init__()
         self.device = device
         self.thermal_encoder = ImageBindThermalEncoder(device=device)
-        self.encoder         = Encoder4M(checkpoint=fourm_checkpoint, device=device)
-        self.connector       = MLPConnector(encoder_dim=encoder_dim, smolvla_dim=smolvla_dim)
         self.smolvla         = SmolVLAWrapper(pretrained=smolvla_checkpoint, device=device)
 
     def forward(self, inputs: dict, batch: dict) -> torch.Tensor:
@@ -40,12 +33,10 @@ class VLAPipeline(nn.Module):
         thermal_emb = self.thermal_encoder(inputs["thermal"])   # (B, 1024)
         inputs["thermal"] = thermal_emb
 
-        # 2. (RGB + depth + seg) + thermal emb → 4M tokens
-        tokens = self.encoder(inputs)                           # (B, T, D)
+        # 2. Pass raw 4M inputs into the SmolVLA wrapper
+        smol_batch = dict(batch)
+        smol_batch["observation.images.4m"] = inputs
 
-        # 3. Projette vers SmolLM2 token space
-        tokens = self.connector(tokens)                         # (B, T, smolvla_dim)
-
-        # 4. SmolVLA génère les actions
-        actions = self.smolvla(batch)                           # (B, action_dim)
+        # 3. SmolVLA génère les actions
+        actions = self.smolvla.select_action(smol_batch)
         return actions
