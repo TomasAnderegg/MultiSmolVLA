@@ -1,25 +1,26 @@
 #!/usr/bin/env python
 """
-Train Block 2 (4M encoder + MLP connector + SmolVLA) on a LIBERO dataset.
+Train the full VLA pipeline (Block1: ThermalGen+ImageBind, Block2: 4M+MLP+SmolVLA) on a LIBERO dataset.
 
 Usage examples:
 
-  # Stage 1: train only the MLP connector (everything else frozen)
-  python scripts/train_block2.py \
-      --freeze_4m --freeze_smolvlm --freeze_action_expert
+  # Stage 1: train only the MLP connector
+  python scripts/train_full_pipeline.py \
+      --freeze_thermalgen --freeze_imagebind --freeze_4m --freeze_smolvlm --freeze_action_expert
 
-  # Stage 2: train MLP + action expert + SmolVLM (4M frozen)
-  python scripts/train_block2.py \
-      --freeze_4m
+  # Stage 2: train MLP + action expert
+  python scripts/train_full_pipeline.py \
+      --freeze_thermalgen --freeze_imagebind --freeze_4m
 
-  # Train everything
-  python scripts/train_block2.py
+  # Train everything except ImageBind (usually kept frozen)
+  python scripts/train_full_pipeline.py \
+      --freeze_imagebind
 
-  # Custom dataset / image key
-  python scripts/train_block2.py \
+  # Custom dataset
+  python scripts/train_full_pipeline.py \
       --dataset lerobot/libero_object_no_noops \
       --image_key observation.images.top \
-      --freeze_4m --freeze_smolvlm
+      --freeze_imagebind --freeze_4m
 """
 
 import argparse
@@ -39,25 +40,27 @@ log = logging.getLogger(__name__)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train Block 2 on LIBERO")
+    parser = argparse.ArgumentParser(description="Train full VLA pipeline on LIBERO")
 
     # Dataset
-    parser.add_argument("--dataset", type=str, default="lerobot/libero_spatial_no_noops",
-                        help="HuggingFace dataset repo id")
+    parser.add_argument("--dataset", type=str, default="lerobot/libero_spatial_no_noops")
     parser.add_argument("--image_key", type=str, default="observation.images.top",
-                        help="Dataset key to use as RGB input to 4M")
+                        help="Dataset key to use as RGB input")
 
     # Checkpoints
     parser.add_argument("--smolvla_checkpoint", type=str, default="lerobot/smolvla_libero")
-    parser.add_argument("--output_dir", type=str, default="checkpoints/block2")
+    parser.add_argument("--fourm_checkpoint", type=str, default="EPFL-VILAB/4M-21_XL")
+    parser.add_argument("--fourm_dim", type=int, default=1024)
+    parser.add_argument("--output_dir", type=str, default="checkpoints/full_pipeline")
 
-    # Model config — freeze flags (passed into LocalSmolVLAConfig)
+    # Freeze flags — Block1
+    parser.add_argument("--freeze_thermalgen", action="store_true", help="Freeze ThermalGen (RGB→thermal generator)")
+    parser.add_argument("--freeze_imagebind", action="store_true", help="Freeze ImageBind thermal encoder")
+    # Freeze flags — Block2
     parser.add_argument("--freeze_4m", action="store_true", help="Freeze the 4M encoder")
     parser.add_argument("--freeze_mlp", action="store_true", help="Freeze the MLP connector")
     parser.add_argument("--freeze_smolvlm", action="store_true", help="Freeze the SmolVLM language model")
     parser.add_argument("--freeze_action_expert", action="store_true", help="Freeze the action expert")
-    parser.add_argument("--fourm_checkpoint", type=str, default="EPFL-VILAB/4M-21_XL")
-    parser.add_argument("--fourm_dim", type=int, default=1024)
 
     # Training hyperparams
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -71,28 +74,39 @@ def parse_args():
     return parser.parse_args()
 
 
-def apply_freeze_flags(block2, cfg):
-    """Freeze/unfreeze components based on LocalSmolVLAConfig flags."""
-    vlm_with_expert = block2.smolvla.policy.base_policy.model.vlm_with_expert
+def apply_freeze_flags(pipeline, args):
+    # Block1 components
+    if args.freeze_thermalgen:
+        for p in pipeline.block1.thermalgen.parameters():
+            p.requires_grad = False
+        log.info("Frozen: ThermalGen")
 
-    if cfg.freeze_4m:
+    if args.freeze_imagebind:
+        for p in pipeline.block1.imagebind.parameters():
+            p.requires_grad = False
+        log.info("Frozen: ImageBind")
+
+    # Block2 components
+    vlm_with_expert = pipeline.block2.smolvla.policy.base_policy.model.vlm_with_expert
+
+    if args.freeze_4m:
         for p in vlm_with_expert.fourm_encoder.parameters():
             p.requires_grad = False
         log.info("Frozen: 4M encoder")
 
-    if cfg.freeze_mlp:
+    if args.freeze_mlp:
         for p in vlm_with_expert.fourm_to_vlm.parameters():
             p.requires_grad = False
         log.info("Frozen: MLP connector")
 
-    if cfg.freeze_smolvlm:
+    if args.freeze_smolvlm:
         for name, p in vlm_with_expert.named_parameters():
             if not name.startswith("fourm_encoder") and not name.startswith("fourm_to_vlm"):
                 p.requires_grad = False
         log.info("Frozen: SmolVLM")
 
-    if cfg.freeze_action_expert:
-        model = block2.smolvla.policy.base_policy.model
+    if args.freeze_action_expert:
+        model = pipeline.block2.smolvla.policy.base_policy.model
         for p in model.action_in_proj.parameters():
             p.requires_grad = False
         for p in model.action_out_proj.parameters():
@@ -103,34 +117,33 @@ def apply_freeze_flags(block2, cfg):
             p.requires_grad = False
         log.info("Frozen: action expert")
 
-    trainable = sum(p.numel() for p in block2.parameters() if p.requires_grad)
-    total = sum(p.numel() for p in block2.parameters())
+    trainable = sum(p.numel() for p in pipeline.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in pipeline.parameters())
     log.info(f"Trainable params: {trainable:,} / {total:,} ({100*trainable/total:.1f}%)")
 
 
-def make_batch(sample, image_key, tokenizer, max_lang_tokens, device):
-    """Convert a LeRobotDataset sample into Block2 inputs + batch dict."""
-    rgb = sample[image_key].to(device)          # (B, 3, H, W)
+def make_batch(sample, args, tokenizer, device):
+    rgb = sample[args.image_key].to(device)
     state = sample["observation.state"].to(device)
     actions = sample["action"].to(device)
+    B = rgb.shape[0]
 
-    # Tokenize language instruction
-    lang = sample.get("language_instruction", [""] * rgb.shape[0])
+    lang = sample.get("language_instruction", [""] * B)
     if isinstance(lang, torch.Tensor):
         lang = [l.decode() if isinstance(l, bytes) else str(l) for l in lang]
     tokenized = tokenizer(
         lang,
         padding="max_length",
         truncation=True,
-        max_length=max_lang_tokens,
+        max_length=args.max_lang_tokens,
         return_tensors="pt",
     )
 
+    # Block1 generates thermal from rgb — depth/seg are zeros (not in LIBERO)
     inputs = {
-        "rgb":     rgb,
-        "depth":   torch.zeros_like(rgb[:, :1]),   # not available in LIBERO
-        "seg":     torch.zeros_like(rgb[:, :1]),   # not available in LIBERO
-        "thermal": torch.zeros(rgb.shape[0], 1024, device=device),  # not available in LIBERO
+        "rgb":   rgb,
+        "depth": torch.zeros_like(rgb[:, :1]),
+        "seg":   torch.zeros_like(rgb[:, :1]),
     }
 
     batch = {
@@ -148,7 +161,6 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     log.info(f"Device: {device}")
 
-    # Load dataset
     from lerobot.datasets import LeRobotDataset
     log.info(f"Loading dataset: {args.dataset}")
     dataset = LeRobotDataset(args.dataset)
@@ -160,42 +172,25 @@ def main():
         pin_memory=True,
     )
 
-    # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolVLM2-500M-Video-Instruct")
 
-    # Build config from CLI flags
-    from src.pipeline.smolvla.configuration_smolvla import LocalSmolVLAConfig
-    cfg = LocalSmolVLAConfig(
+    from src.pipeline.full_pipeline import VLAPipeline
+    log.info("Building VLAPipeline ...")
+    pipeline = VLAPipeline(
+        smolvla_checkpoint=args.smolvla_checkpoint,
         fourm_checkpoint=args.fourm_checkpoint,
         fourm_dim=args.fourm_dim,
-        freeze_4m=args.freeze_4m,
-        freeze_mlp=args.freeze_mlp,
-        freeze_smolvlm=args.freeze_smolvlm,
-        freeze_action_expert=args.freeze_action_expert,
-    )
-    log.info(f"Config: freeze_4m={cfg.freeze_4m}, freeze_mlp={cfg.freeze_mlp}, "
-             f"freeze_smolvlm={cfg.freeze_smolvlm}, freeze_action_expert={cfg.freeze_action_expert}")
-
-    # Build Block2 (freezing handled manually after load so all weights are initialized first)
-    from src.pipeline.block2 import Block2
-    log.info("Building Block2 ...")
-    block2 = Block2(
-        fourm_checkpoint=cfg.fourm_checkpoint,
-        smolvla_checkpoint=args.smolvla_checkpoint,
-        use_4m=cfg.use_4m,
+        use_4m=True,
         freeze_4m=False,
         freeze_mlp=False,
-        fourm_dim=cfg.fourm_dim,
         device=device,
     )
-    block2.train()
+    pipeline.train()
 
-    # Apply freeze flags from config
-    apply_freeze_flags(block2, cfg)
+    apply_freeze_flags(pipeline, args)
 
-    # Optimizer — only trainable params
     optimizer = torch.optim.AdamW(
-        [p for p in block2.parameters() if p.requires_grad],
+        [p for p in pipeline.parameters() if p.requires_grad],
         lr=args.lr,
     )
 
@@ -210,11 +205,9 @@ def main():
             if step >= args.steps:
                 break
 
-            inputs, batch = make_batch(
-                sample, args.image_key, tokenizer, args.max_lang_tokens, device
-            )
+            inputs, batch = make_batch(sample, args, tokenizer, device)
 
-            loss_dict = block2.compute_loss(inputs, batch)
+            loss_dict = pipeline.compute_loss(inputs, batch, epoch=step)
             loss = loss_dict["loss"]
 
             optimizer.zero_grad()
@@ -230,13 +223,12 @@ def main():
                 running_loss = 0.0
 
             if step % args.save_every == 0:
-                ckpt = os.path.join(args.output_dir, f"block2_step{step}.pt")
-                torch.save(block2.state_dict(), ckpt)
+                ckpt = os.path.join(args.output_dir, f"pipeline_step{step}.pt")
+                torch.save(pipeline.state_dict(), ckpt)
                 log.info(f"Saved checkpoint: {ckpt}")
 
-    # Final save
-    ckpt = os.path.join(args.output_dir, "block2_final.pt")
-    torch.save(block2.state_dict(), ckpt)
+    ckpt = os.path.join(args.output_dir, "pipeline_final.pt")
+    torch.save(pipeline.state_dict(), ckpt)
     log.info(f"Training done. Final checkpoint: {ckpt}")
 
 

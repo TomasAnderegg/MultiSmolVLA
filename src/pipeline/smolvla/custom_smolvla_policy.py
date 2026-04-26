@@ -146,9 +146,16 @@ class CustomSmolVLAPolicy(nn.Module):
         return self._base_prepare_images(batch)
 
     def forward(self, batch: dict[str, Tensor], noise=None, time=None, reduction: str = "mean") -> dict[str, Tensor]:
+        # attention_mask from tokenizers is Long (0/1); smolvlm_with_expert needs bool
+        if "observation.language.attention_mask" in batch:
+            batch = dict(batch)
+            batch["observation.language.attention_mask"] = batch["observation.language.attention_mask"].bool()
         return self.base_policy.forward(batch, noise=noise, time=time, reduction=reduction)
 
     def select_action(self, batch: dict[str, Tensor], noise: Optional[Tensor] = None, **kwargs) -> Tensor:
+        if "observation.language.attention_mask" in batch:
+            batch = dict(batch)
+            batch["observation.language.attention_mask"] = batch["observation.language.attention_mask"].bool()
         return self.base_policy.select_action(batch, noise=noise, **kwargs)
 
     def predict_action_chunk(self, batch: dict[str, Tensor], noise: Optional[Tensor] = None, **kwargs) -> Tensor:

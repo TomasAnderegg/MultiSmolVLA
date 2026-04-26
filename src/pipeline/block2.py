@@ -42,12 +42,14 @@ class Block2(nn.Module):
         )
 
     def forward(self, inputs: dict, batch: dict) -> torch.Tensor:
+        """Inference: returns actions (B, action_dim)."""
         smol_batch = dict(batch)
         smol_batch["observation.images.4m"] = inputs
-
-        # attention_mask from tokenizers is Long (0/1); smolvlm_with_expert needs bool
-        if "observation.language.attention_mask" in smol_batch:
-            smol_batch["observation.language.attention_mask"] = smol_batch["observation.language.attention_mask"].bool()
-
         actions = self.smolvla.select_action(smol_batch)
         return actions
+
+    def compute_loss(self, inputs: dict, batch: dict) -> dict:
+        """Training: returns loss dict from SmolVLA policy."""
+        smol_batch = dict(batch)
+        smol_batch["observation.images.4m"] = inputs
+        return self.smolvla.policy.forward(smol_batch)

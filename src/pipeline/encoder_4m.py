@@ -78,5 +78,4 @@ class Encoder4M(nn.Module):
             x = encoder_tokens + encoder_emb
             tokens = self.model.forward_encoder(x, encoder_mask=encoder_mask)  # (B, 196, D)
 
-        print(f"[Encoder4M] output shape: {tokens.shape}")
         return tokens

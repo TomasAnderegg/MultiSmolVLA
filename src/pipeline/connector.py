@@ -17,6 +17,4 @@ class MLPConnector(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.mlp(x)
-        print(f"[Connector] output shape: {out.shape}")
-        return out
+        return self.mlp(x)
