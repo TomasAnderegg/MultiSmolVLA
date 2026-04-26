@@ -8,6 +8,20 @@ from transformers import AutoTokenizer
 
 from src.pipeline.block2 import Block2
 
+IMAGE_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "rgb_for_test.jpeg")
+
+
+def load_rgb(path: str, device: str) -> torch.Tensor:
+    """Load a JPEG and return (1, 3, 224, 224) float tensor in [0, 1]."""
+    from PIL import Image
+    from torchvision import transforms
+    img = Image.open(path).convert("RGB")
+    tf = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),  # -> (3, 224, 224) in [0, 1]
+    ])
+    return tf(img).unsqueeze(0).to(device)  # (1, 3, 224, 224)
+
 
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -31,8 +45,15 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolVLM2-500M-Video-Instruct")
 
     B = 1
+    if os.path.exists(IMAGE_PATH):
+        print(f"Using real image: {IMAGE_PATH}")
+        rgb = load_rgb(IMAGE_PATH, device)
+    else:
+        print("No real image found, using random noise.")
+        rgb = torch.randn(B, 3, 224, 224, device=device)
+
     inputs = {
-        "rgb": torch.randn(B, 3, 224, 224, device=device),
+        "rgb": rgb,
         "depth": torch.randn(B, 1, 224, 224, device=device),
         "seg": torch.randn(B, 1, 224, 224, device=device),
         "thermal": torch.randn(B, 1024, device=device),  # pre-encoded by ImageBind
