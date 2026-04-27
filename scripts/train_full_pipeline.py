@@ -63,7 +63,8 @@ def parse_args():
     parser.add_argument("--freeze_action_expert", action="store_true", help="Freeze the action expert")
 
     # Training hyperparams
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--lr_mlp", type=float, default=1e-3)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--steps", type=int, default=10_000)
     parser.add_argument("--save_every", type=int, default=1000)
@@ -187,11 +188,21 @@ def main():
     )
     pipeline.train()
 
+    # Applying different LR for the MLP and the SmolVLM
+    vlm_with_expert = pipeline.block2.smolvla.policy.base_policy.model.vlm_with_expert
+    mlp_params = set(vlm_with_expert.fourm_to_vlm.parameters())
+
+    other_params = [p for p in pipeline.parameters()
+                if p.requires_grad and p not in mlp_params]
+
+    mlp_trainable = [p for p in mlp_params if p.requires_grad]
+
     apply_freeze_flags(pipeline, args)
 
-    optimizer = torch.optim.AdamW(
-        [p for p in pipeline.parameters() if p.requires_grad],
-        lr=args.lr,
+    optimizer = torch.optim.AdamW([
+        {'params': other_params, 'lr':args.lr},
+        {'params': mlp_trainable, 'lr':args.lr_mlp}
+    ]
     )
 
     os.makedirs(args.output_dir, exist_ok=True)

@@ -86,7 +86,8 @@ class CustomSmolVLAPolicy(nn.Module):
         # and so we keep the pretrained lerobot/smolvla_libero weights.
         vlm = self.base_policy.model.vlm_with_expert
 
-        vlm.use_4m = use_4m
+        vlm.use_4m = use_4m #on crée un nouvel attribut use_4m sur l'instance vlm meme si cet attribut 
+        # n'existe pas de base dans SmolVLMWithExpertModel (python l'accepte)
 
         # Attach 4M encoder — nn.Module.__setattr__ registers it as a proper submodule
         vlm.fourm_encoder = Encoder4M(checkpoint=fourm_checkpoint, device=device)
@@ -106,7 +107,7 @@ class CustomSmolVLAPolicy(nn.Module):
 
         # Monkey-patch embed_image on this instance, falling back to the original class method
         original_embed_image = vlm.embed_image  # bound to vlm, calls SmolVLMWithExpertModel.embed_image
-
+        #on sauvegarde la methode originale avant de la remplacer comme back-up
         def _embed_image(self_vlm, image):
             if self_vlm.use_4m:
                 if isinstance(image, dict):
@@ -116,10 +117,13 @@ class CustomSmolVLAPolicy(nn.Module):
                 else:
                     return original_embed_image(image)
                 tokens = tokens.to(self_vlm.fourm_to_vlm.mlp[0].weight.dtype)
+                # 4M tourne en float16, le MLP en float32 (défaut pytorch). Cette ligne ocnvertit les tokens dans
+                # le bon dtype avant de les passer au MLP pour eviter une erreur
                 return self_vlm.fourm_to_vlm(tokens)
             return original_embed_image(image)
 
-        vlm.embed_image = types.MethodType(_embed_image, vlm)
+        vlm.embed_image = types.MethodType(_embed_image, vlm) #la fonction types.methodtype permet
+        # de mettre la fonction _embed_image comme methode dans le smolVLA!
 
         # prepare_images lives on SmolVLAPolicy (self.base_policy), not on VLAFlowMatching (self.base_policy.model)
         self.base_policy._base_prepare_images = self.base_policy.prepare_images
@@ -146,13 +150,22 @@ class CustomSmolVLAPolicy(nn.Module):
         return self._base_prepare_images(batch)
 
     def forward(self, batch: dict[str, Tensor], noise=None, time=None, reduction: str = "mean") -> dict[str, Tensor]:
+        '''
+         Forward appelle base.policy.forward qui calcule la loss (training)
+        '''
         # attention_mask from tokenizers is Long (0/1); smolvlm_with_expert needs bool
         if "observation.language.attention_mask" in batch:
             batch = dict(batch)
             batch["observation.language.attention_mask"] = batch["observation.language.attention_mask"].bool()
+            #lorsqu'on tokenize la phrase, le tokenizer retourne un attention mask en int64 par defaut
+            # et SmolVLM s'attend a un bool donc on change
+            # NB: Un attention mask indique au modèle quels tokens sont importants et lesquels doivent être ignorés.
         return self.base_policy.forward(batch, noise=noise, time=time, reduction=reduction)
 
     def select_action(self, batch: dict[str, Tensor], noise: Optional[Tensor] = None, **kwargs) -> Tensor:
+        '''
+         select_action appelle base.policy.select_action qui retourne une action (inference)
+        '''
         if "observation.language.attention_mask" in batch:
             batch = dict(batch)
             batch["observation.language.attention_mask"] = batch["observation.language.attention_mask"].bool()
