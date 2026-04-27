@@ -8,8 +8,8 @@
 #SBATCH --output=logs/test_block2_%j.out
 
 eval "$(conda shell.bash hook)"
-conda activate lerobot
+conda activate $SCRATCH/envs/multismolvla
 
-cd /home/apapadat/MultiSmolVLA
+cd /home/garate/MultiSmolVLA
 
 python scripts/test_block2.py
