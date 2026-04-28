@@ -7,7 +7,7 @@ from tqdm import tqdm
 DATASET_NAME = "binhng/libero_10_lerobot_mask_depth"
 API_URL = f"https://huggingface.co/api/datasets/{DATASET_NAME}"
 
-OUTPUT_DIR = "data/parquet"
+OUTPUT_DIR = os.environ.get("DATA_DIR", "/scratch/izar/garate/data/parquet")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Fetch dataset file list

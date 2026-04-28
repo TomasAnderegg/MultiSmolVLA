@@ -23,8 +23,8 @@ from third_party.ThermalGen.models.generative_models.sit_networks.transport impo
 import yaml
 from huggingface_hub import PyTorchModelHubMixin
 
-INPUT_DIR = "data/parquet"
-OUTPUT_DIR = "data/parquet_thermal"
+INPUT_DIR = os.environ.get("DATA_DIR", "/scratch/izar/garate/data/parquet")
+OUTPUT_DIR = os.environ.get("DATA_DIR_THERMAL", "/scratch/izar/garate/data/parquet_thermal")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
