@@ -30,7 +30,7 @@ def main():
     print(f"CUDA available: {torch.cuda.is_available()}")
 
     try:
-        pipeline = Block2(fourm_checkpoint="EPFL-VILAB/4M-21_B", device=device)
+        pipeline = Block2(fourm_checkpoint="EPFL-VILAB/4M-21_XL", device=device)
     except ModuleNotFoundError as error:
         print("\nERROR: missing package while importing Block2:")
         print(f"  {error}")

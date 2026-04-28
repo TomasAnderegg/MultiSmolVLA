@@ -12,4 +12,4 @@ conda activate $SCRATCH/envs/multismolvla
 
 cd /home/garate/MultiSmolVLA
 
-python scripts/test_block2.py
+python scripts/test_pipeline.py
