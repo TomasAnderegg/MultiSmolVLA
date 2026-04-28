@@ -28,7 +28,7 @@ def main():
     print(f"\n{'='*50}\nDevice: {device}\n{'='*50}\n")
 
     try:
-        pipeline = VLAPipeline(fourm_checkpoint="EPFL-VILAB/4M-21_B", device=device)
+        pipeline = VLAPipeline(fourm_checkpoint="EPFL-VILAB/4M-21_XL", device=device)
     except Exception as error:
         print(f"\nERROR while creating VLAPipeline:\n{error}")
         return

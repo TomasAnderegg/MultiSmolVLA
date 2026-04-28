@@ -7,6 +7,8 @@
 #SBATCH --time=00:30:00
 #SBATCH --output=logs/test_block2_%j.out
 
+nvidia-smi
+
 eval "$(conda shell.bash hook)"
 conda activate $SCRATCH/envs/multismolvla
 
