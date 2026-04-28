@@ -10,6 +10,8 @@
 
 mkdir -p logs
 
+export HF_TOKEN="${HF_TOKEN}"  # set via: echo 'export HF_TOKEN="hf_..."' >> ~/.bashrc
+
 eval "$(conda shell.bash hook)"
 conda activate /scratch/izar/$USER/envs/multismolvla
 

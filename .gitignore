@@ -3,6 +3,8 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+scripts/run_thermal_pipeline.sh
+
 # C extensions
 *.so
 # Autres
