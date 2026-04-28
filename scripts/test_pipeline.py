@@ -1,3 +1,4 @@
+import argparse
 import os
 import sys
 
@@ -7,6 +8,12 @@ import torch
 from transformers import AutoTokenizer
 
 from src.pipeline.full_pipeline import VLAPipeline
+
+_FOURM_VARIANTS = {
+    "B":  ("EPFL-VILAB/4M-21_B",  768),
+    "L":  ("EPFL-VILAB/4M-21_L",  1024),
+    "XL": ("EPFL-VILAB/4M-21_XL", 1024),
+}
 
 IMAGE_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "rgb_for_test.jpeg")
 
@@ -24,11 +31,19 @@ def load_rgb(path: str, device: str) -> torch.Tensor:
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Test full VLA pipeline forward pass")
+    parser.add_argument("--fourm_model", type=str, default="XL", choices=["B", "L", "XL"],
+                        help="4M-21 variant: B (dim=768), L (dim=1024), XL (dim=1024)")
+    args = parser.parse_args()
+
+    fourm_checkpoint, fourm_dim = _FOURM_VARIANTS[args.fourm_model]
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"\n{'='*50}\nDevice: {device}\n{'='*50}\n")
+    print(f"4M variant: {args.fourm_model} → {fourm_checkpoint} (dim={fourm_dim})")
 
     try:
-        pipeline = VLAPipeline(fourm_checkpoint="EPFL-VILAB/4M-21_XL", device=device)
+        pipeline = VLAPipeline(fourm_checkpoint=fourm_checkpoint, fourm_dim=fourm_dim, device=device)
     except Exception as error:
         print(f"\nERROR while creating VLAPipeline:\n{error}")
         return
