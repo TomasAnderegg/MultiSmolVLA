@@ -49,6 +49,9 @@ def parse_args():
 
     # Checkpoints
     parser.add_argument("--smolvla_checkpoint", type=str, default="lerobot/smolvla_libero")
+    parser.add_argument("--fourm_model", type=str, default=None, choices=["B", "L", "XL"],
+                        help="4M-21 variant shortcut (B=768d, L/XL=1024d). "
+                             "Overrides --fourm_checkpoint and --fourm_dim when set.")
     parser.add_argument("--fourm_checkpoint", type=str, default="EPFL-VILAB/4M-21_XL")
     parser.add_argument("--fourm_dim", type=int, default=1024)
     parser.add_argument("--output_dir", type=str, default="checkpoints/full_pipeline")
@@ -157,8 +160,20 @@ def make_batch(sample, args, tokenizer, device):
     return inputs, batch
 
 
+_FOURM_VARIANTS = {
+    "B":  ("EPFL-VILAB/4M-21_B",  768),
+    "L":  ("EPFL-VILAB/4M-21_L",  1024),
+    "XL": ("EPFL-VILAB/4M-21_XL", 1024),
+}
+
+
 def main():
     args = parse_args()
+
+    if args.fourm_model is not None:
+        args.fourm_checkpoint, args.fourm_dim = _FOURM_VARIANTS[args.fourm_model]
+        log.info(f"4M variant: {args.fourm_model} → {args.fourm_checkpoint} (dim={args.fourm_dim})")
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     log.info(f"Device: {device}")
 

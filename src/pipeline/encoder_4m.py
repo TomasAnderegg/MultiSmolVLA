@@ -25,7 +25,7 @@ class Encoder4M(nn.Module):
     NUM_PATCHES = 196
 
     def __init__(self, checkpoint: str = "EPFL-VILAB/4M-21_XL", device: str = "cuda",
-                 dtype: torch.dtype = torch.float16):
+                 dtype: torch.dtype = torch.float32):
         super().__init__()
         self.device = device
         self.dtype = dtype

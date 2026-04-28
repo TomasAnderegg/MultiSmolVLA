@@ -1,3 +1,4 @@
+import argparse
 import os
 import sys
 
@@ -7,6 +8,12 @@ import torch
 from transformers import AutoTokenizer
 
 from src.pipeline.block2 import Block2
+
+_FOURM_VARIANTS = {
+    "B":  ("EPFL-VILAB/4M-21_B",  768),
+    "L":  ("EPFL-VILAB/4M-21_L",  1024),
+    "XL": ("EPFL-VILAB/4M-21_XL", 1024),
+}
 
 IMAGE_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "rgb_for_test.jpeg")
 
@@ -24,13 +31,21 @@ def load_rgb(path: str, device: str) -> torch.Tensor:
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Test Block2 forward pass")
+    parser.add_argument("--fourm_model", type=str, default="XL", choices=["B", "L", "XL"],
+                        help="4M-21 variant: B (dim=768), L (dim=1024), XL (dim=1024)")
+    args = parser.parse_args()
+
+    fourm_checkpoint, fourm_dim = _FOURM_VARIANTS[args.fourm_model]
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
     print(f"Torch version: {torch.__version__}")
     print(f"CUDA available: {torch.cuda.is_available()}")
+    print(f"4M variant: {args.fourm_model} → {fourm_checkpoint} (dim={fourm_dim})")
 
     try:
-        pipeline = Block2(fourm_checkpoint="EPFL-VILAB/4M-21_XL", device=device)
+        pipeline = Block2(fourm_checkpoint=fourm_checkpoint, fourm_dim=fourm_dim, device=device)
     except ModuleNotFoundError as error:
         print("\nERROR: missing package while importing Block2:")
         print(f"  {error}")
