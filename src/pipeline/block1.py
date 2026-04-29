@@ -25,11 +25,15 @@ class Block1(nn.Module):
 
     def forward(self, inputs: dict, epoch: int = 0) -> dict:
         """
-        inputs : {"rgb", "depth", "seg"}
+        inputs : {"rgb", "depth", "seg"} or {"rgb", "depth", "seg", "thermal"}
         epoch  : epoch courante pour le curriculum dropout (ignoré à l'inférence)
+        If "thermal" is already present in inputs (pre-computed), ThermalGen is skipped.
         """
-        # 1. Générer la thermique synthétique depuis le RGB
-        thermal = self.thermalgen(inputs["rgb"])           # (B, 3, 224, 224)
+        # 1. Use pre-computed thermal if provided, otherwise generate from RGB
+        if "thermal" in inputs:
+            thermal = inputs["thermal"]                    # (B, 3, 224, 224)
+        else:
+            thermal = self.thermalgen(inputs["rgb"])       # (B, 3, 224, 224)
 
         # 2. Assembler les 4 modalités
         inputs = {**inputs, "thermal": thermal}

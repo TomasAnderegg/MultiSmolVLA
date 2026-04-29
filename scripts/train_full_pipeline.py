@@ -42,10 +42,14 @@ log = logging.getLogger(__name__)
 def parse_args():
     parser = argparse.ArgumentParser(description="Train full VLA pipeline on LIBERO")
 
-    # Dataset
-    parser.add_argument("--dataset", type=str, default="lerobot/libero_spatial_no_noops")
+    # Dataset — use --data_dir to load pre-generated parquet shards (recommended),
+    # or --dataset to stream from HuggingFace (thermal generated on-the-fly, slower)
+    parser.add_argument("--data_dir", type=str, default=None,
+                        help="Path to parquet_thermal/ directory (pre-generated all 4 modalities)")
+    parser.add_argument("--dataset", type=str, default="lerobot/libero_spatial_no_noops",
+                        help="HuggingFace dataset id (fallback when --data_dir is not set)")
     parser.add_argument("--image_key", type=str, default="observation.images.top",
-                        help="Dataset key to use as RGB input")
+                        help="Dataset key to use as RGB input (only used with --dataset)")
 
     # Checkpoints
     parser.add_argument("--smolvla_checkpoint", type=str, default="lerobot/smolvla_libero")
@@ -126,9 +130,9 @@ def apply_freeze_flags(pipeline, args):
     log.info(f"Trainable params: {trainable:,} / {total:,} ({100*trainable/total:.1f}%)")
 
 
-def make_batch(sample, args, tokenizer, device):
-    rgb = sample[args.image_key].to(device)
-    state = sample["observation.state"].to(device)
+def make_batch(sample, args, tokenizer, device, has_precomputed_modalities=False):
+    rgb     = sample["rgb" if has_precomputed_modalities else args.image_key].to(device)
+    state   = sample["observation.state"].to(device)
     actions = sample["action"].to(device)
     B = rgb.shape[0]
 
@@ -143,12 +147,21 @@ def make_batch(sample, args, tokenizer, device):
         return_tensors="pt",
     )
 
-    # Block1 generates thermal from rgb — depth/seg are zeros (not in LIBERO)
-    inputs = {
-        "rgb":   rgb,
-        "depth": torch.zeros_like(rgb[:, :1]),
-        "seg":   torch.zeros_like(rgb[:, :1]),
-    }
+    if has_precomputed_modalities:
+        # All 4 modalities available from pre-generated parquet dataset
+        inputs = {
+            "rgb":     rgb,
+            "depth":   sample["depth"].to(device),    # (B, 1, 224, 224)
+            "seg":     sample["seg"].to(device),      # (B, 1, 224, 224)
+            "thermal": sample["thermal"].to(device),  # (B, 3, 224, 224) — skips ThermalGen in Block1
+        }
+    else:
+        # HuggingFace dataset: only RGB available, Block1 generates thermal on-the-fly
+        inputs = {
+            "rgb":   rgb,
+            "depth": torch.zeros_like(rgb[:, :1]),
+            "seg":   torch.zeros_like(rgb[:, :1]),
+        }
 
     batch = {
         "observation.state": state,
@@ -177,9 +190,19 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     log.info(f"Device: {device}")
 
-    from lerobot.datasets import LeRobotDataset
-    log.info(f"Loading dataset: {args.dataset}")
-    dataset = LeRobotDataset(args.dataset)
+    if args.data_dir:
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+        from utils.parquet_dataset import ParquetThermalDataset
+        log.info(f"Loading pre-generated parquet dataset from: {args.data_dir}")
+        dataset = ParquetThermalDataset(args.data_dir)
+        has_precomputed_modalities = True
+    else:
+        from lerobot.datasets import LeRobotDataset
+        log.info(f"Loading HuggingFace dataset: {args.dataset} (thermal generated on-the-fly)")
+        dataset = LeRobotDataset(args.dataset)
+        has_precomputed_modalities = False
+
+    log.info(f"Dataset size: {len(dataset)} samples")
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -231,7 +254,7 @@ def main():
             if step >= args.steps:
                 break
 
-            inputs, batch = make_batch(sample, args, tokenizer, device)
+            inputs, batch = make_batch(sample, args, tokenizer, device, has_precomputed_modalities)
 
             loss_dict = pipeline.compute_loss(inputs, batch, epoch=step)
             loss = loss_dict["loss"]
