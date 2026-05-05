@@ -1,3 +1,16 @@
+# Data & checkpoints
+data/parquet/
+data/parquet_scratch
+data/parquet_scratch/
+data/parquet_thermal/
+models/
+*.parquet
+
+# Logs
+logs/
+scripts/logs/
+*.out
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

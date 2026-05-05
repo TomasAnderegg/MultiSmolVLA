@@ -180,6 +180,164 @@ python scripts/test_pipeline.py # Full pipeline — requires GPU
 
 ---
 
+## CLI Reference
+
+### `scripts/train_block2.py` — Stage 1 : alignement du connecteur MLP
+
+```bash
+python scripts/train_block2.py [OPTIONS]
+```
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `--dataset` | str | `lerobot/libero_spatial_no_noops` | Repo HuggingFace du dataset |
+| `--image_key` | str | `observation.images.top` | Clé du dataset utilisée comme entrée RGB dans 4M |
+| `--smolvla_checkpoint` | str | `lerobot/smolvla_libero` | Checkpoint SmolVLA de base |
+| `--output_dir` | str | `checkpoints/block2` | Dossier de sauvegarde des checkpoints |
+| `--fourm_model` | `B\|L\|XL` | `None` | Variante 4M-21 (B=768d, L/XL=1024d). Override `--fourm_checkpoint` et `--fourm_dim` |
+| `--fourm_checkpoint` | str | `EPFL-VILAB/4M-21_XL` | Checkpoint 4M-21 HuggingFace |
+| `--fourm_dim` | int | `1024` | Dimension des features 4M-21 |
+| `--freeze_4m` | flag | `False` | Gèle l'encodeur 4M |
+| `--freeze_mlp` | flag | `False` | Gèle le connecteur MLP |
+| `--freeze_smolvlm` | flag | `False` | Gèle le LLM SmolVLM |
+| `--freeze_action_expert` | flag | `False` | Gèle l'action expert |
+| `--lr` | float | `1e-4` | Learning rate |
+| `--batch_size` | int | `4` | Taille du batch |
+| `--steps` | int | `10000` | Nombre de steps d'entraînement |
+| `--save_every` | int | `1000` | Fréquence de sauvegarde (en steps) |
+| `--log_every` | int | `50` | Fréquence de logging (en steps) |
+| `--num_workers` | int | `4` | Workers du DataLoader |
+| `--max_lang_tokens` | int | `48` | Longueur max des tokens de langage |
+| `--dummy` | flag | `False` | Utilise des inputs aléatoires (smoke-test sans dataset) |
+| `--dummy_state_dim` | int | `7` | Dimension de l'état robot en mode dummy |
+| `--dummy_action_dim` | int | `7` | Dimension des actions en mode dummy |
+| `--dummy_action_steps` | int | `50` | Chunk size en mode dummy (doit matcher `chunk_size=50`) |
+
+**Exemples :**
+```bash
+# Stage 1 standard
+python scripts/train_block2.py --fourm_model XL --lr 1e-4 --batch_size 8 --steps 20000
+
+# Smoke-test rapide sans GPU ni dataset
+python scripts/train_block2.py --dummy --steps 10 --fourm_model B
+
+# Geler tout sauf le connecteur MLP
+python scripts/train_block2.py --freeze_4m --freeze_smolvlm --freeze_action_expert
+```
+
+---
+
+### `scripts/train_full_pipeline.py` — Stage 2 : fine-tuning robustesse
+
+```bash
+python scripts/train_full_pipeline.py [OPTIONS]
+```
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `--dataset` | str | `lerobot/libero_spatial_no_noops` | Repo HuggingFace du dataset |
+| `--image_key` | str | `observation.images.top` | Clé du dataset utilisée comme entrée RGB |
+| `--smolvla_checkpoint` | str | `lerobot/smolvla_libero` | Checkpoint SmolVLA de base |
+| `--fourm_model` | `B\|L\|XL` | `None` | Variante 4M-21 |
+| `--fourm_checkpoint` | str | `EPFL-VILAB/4M-21_XL` | Checkpoint 4M-21 |
+| `--fourm_dim` | int | `1024` | Dimension des features 4M-21 |
+| `--output_dir` | str | `checkpoints/full_pipeline` | Dossier de sauvegarde |
+| `--freeze_thermalgen` | flag | `False` | Gèle ThermalGen (générateur RGB→thermal) |
+| `--freeze_imagebind` | flag | `False` | Gèle l'encodeur thermal ImageBind |
+| `--freeze_4m` | flag | `False` | Gèle l'encodeur 4M |
+| `--freeze_mlp` | flag | `False` | Gèle le connecteur MLP |
+| `--freeze_smolvlm` | flag | `False` | Gèle le LLM SmolVLM |
+| `--freeze_action_expert` | flag | `False` | Gèle l'action expert |
+| `--lr` | float | `1e-5` | Learning rate global |
+| `--lr_mlp` | float | `1e-3` | Learning rate spécifique au connecteur MLP |
+| `--batch_size` | int | `4` | Taille du batch |
+| `--steps` | int | `10000` | Nombre de steps d'entraînement |
+| `--save_every` | int | `1000` | Fréquence de sauvegarde (en steps) |
+| `--log_every` | int | `50` | Fréquence de logging (en steps) |
+| `--num_workers` | int | `4` | Workers du DataLoader |
+| `--max_lang_tokens` | int | `48` | Longueur max des tokens de langage |
+
+**Exemples :**
+```bash
+# Stage 2 complet — tout entraînable
+python scripts/train_full_pipeline.py --fourm_model XL --lr 1e-5 --lr_mlp 1e-3 --steps 30000
+
+# Geler Block 1, fine-tuner seulement Block 2
+python scripts/train_full_pipeline.py --freeze_thermalgen --freeze_imagebind --freeze_4m
+```
+
+---
+
+### `src/pipeline/modality_dropout.py` — Test / debug du dropout
+
+```bash
+python src/pipeline/modality_dropout.py [OPTIONS]
+```
+
+| Flag | Type | Default | Choix | Description |
+|---|---|---|---|---|
+| `--modalities` | str+ | `rgb depth seg thermal` | `rgb` `depth` `seg` `thermal` | Modalités à inclure dans le dropout |
+| `--p_drop` | float | `0.5` | `[0, 1]` | Probabilité de corrompre chaque modalité à chaque step |
+| `--alpha_min` | float | `0.0` | `[0, 1]` | Alpha minimum en fin de curriculum (`0.0` = hard dropout, `1.0` = pas de corruption) |
+| `--total_epochs` | int | `100` | — | Nombre d'epochs pour le curriculum schedule |
+| `--corruption_types` | str+ | `gaussian blur occlusion` | `gaussian` `blur` `occlusion` | Types de corruption soft appliqués |
+| `--epoch` | int | `0` | — | Epoch courante (affiche l'alpha correspondant) |
+| `--img_size` | int | `64` | — | Taille spatiale des tenseurs de test |
+
+**Exemples :**
+```bash
+# Tester le dropout à mi-curriculum avec seulement RGB et thermal
+python src/pipeline/modality_dropout.py --modalities rgb thermal --epoch 50 --total_epochs 100
+
+# Hard dropout agressif, seulement bruit gaussien
+python src/pipeline/modality_dropout.py --p_drop 0.9 --alpha_min 0.0 --corruption_types gaussian
+
+# Voir l'alpha à différentes epochs
+python src/pipeline/modality_dropout.py --epoch 0 --total_epochs 200   # alpha=1.0
+python src/pipeline/modality_dropout.py --epoch 100 --total_epochs 200  # alpha=0.5
+python src/pipeline/modality_dropout.py --epoch 200 --total_epochs 200  # alpha=0.0
+```
+
+---
+
+### `scripts/upload_thermal_hf.py` — Upload dataset sur HuggingFace
+
+```bash
+python scripts/upload_thermal_hf.py --repo <username>/<repo-name> [OPTIONS]
+```
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `--repo` | str | *(requis)* | Identifiant du repo HuggingFace (ex: `TomasAnderegg/libero_10_thermal`) |
+| `--private` | flag | `False` | Rendre le dataset privé |
+| `--path_in_repo` | str | `data/train` | Chemin dans le repo HuggingFace où déposer les fichiers |
+
+**Exemples :**
+```bash
+# Upload privé
+python scripts/upload_thermal_hf.py --repo TomasAnderegg/libero_10_thermal --private
+
+# Upload public dans un sous-dossier custom
+python scripts/upload_thermal_hf.py --repo TomasAnderegg/libero_10_thermal --path_in_repo data/parquet
+```
+
+> Le token HuggingFace est lu depuis `$HF_TOKEN`, puis `/scratch/izar/garate/huggingface_cache/token`, puis les credentials sauvegardés par `hf auth login`. Le token doit avoir la permission **Write**.
+
+---
+
+### `scripts/test_block2.py` / `scripts/test_pipeline.py` — Sanity checks
+
+```bash
+python scripts/test_block2.py [--fourm_model B|L|XL]
+python scripts/test_pipeline.py [--fourm_model B|L|XL]
+```
+
+| Flag | Type | Default | Choix | Description |
+|---|---|---|---|---|
+| `--fourm_model` | str | `XL` | `B` `L` `XL` | Variante 4M-21 à tester (B=768d, L/XL=1024d) |
+
+---
+
 ## Dependencies
 
 | Package | Version | Notes |

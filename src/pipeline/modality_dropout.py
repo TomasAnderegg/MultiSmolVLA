@@ -1,17 +1,21 @@
+import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import random
 
+AVAILABLE_MODALITIES = ["rgb", "depth", "seg", "thermal"]
+AVAILABLE_CORRUPTIONS = ["gaussian", "blur", "occlusion"]
+
 
 class ModalityDropout(nn.Module):
     """
     Module de dropout unifié pour les modalités.
-    
+
     alpha = 1.0  →  modalité clean
     alpha = 0.5  →  corruption modérée (soft)
     alpha = 0.0  →  zéro complet (hard dropout)
-    
+
     Le curriculum schedule pilote alpha de 1.0 → 0.0 au fil des epochs.
     """
 
@@ -151,3 +155,75 @@ class ModalityDropout(nn.Module):
                 outputs[modality] = x
 
         return outputs
+
+    # ------------------------------------------------------------------
+    # CLI helpers
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def add_args(cls, parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+        """Ajoute les flags ModalityDropout à un parser existant."""
+        g = parser.add_argument_group("ModalityDropout")
+        g.add_argument(
+            "--modalities",
+            nargs="+",
+            default=["rgb", "depth", "seg", "thermal"],
+            choices=AVAILABLE_MODALITIES,
+            help="Modalités à inclure dans le dropout.",
+        )
+        g.add_argument(
+            "--p_drop",
+            type=float,
+            default=0.5,
+            help="Probabilité de corrompre chaque modalité à chaque step [0, 1].",
+        )
+        g.add_argument(
+            "--alpha_min",
+            type=float,
+            default=0.0,
+            help="Alpha minimum en fin de curriculum (0.0 = hard dropout, 1.0 = pas de corruption).",
+        )
+        g.add_argument(
+            "--total_epochs",
+            type=int,
+            default=100,
+            help="Nombre total d'epochs pour le curriculum schedule.",
+        )
+        g.add_argument(
+            "--corruption_types",
+            nargs="+",
+            default=["gaussian", "blur", "occlusion"],
+            choices=AVAILABLE_CORRUPTIONS,
+            help="Types de corruption soft utilisés.",
+        )
+        return parser
+
+    @classmethod
+    def from_args(cls, args: argparse.Namespace) -> "ModalityDropout":
+        return cls(
+            modalities=args.modalities,
+            p_drop=args.p_drop,
+            alpha_min=args.alpha_min,
+            total_epochs=args.total_epochs,
+            corruption_types=args.corruption_types,
+        )
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Test ModalityDropout")
+    ModalityDropout.add_args(parser)
+    parser.add_argument("--epoch", type=int, default=0, help="Epoch courante (pour afficher alpha).")
+    parser.add_argument("--img_size", type=int, default=64, help="Taille spatiale des tenseurs de test.")
+    args = parser.parse_args()
+
+    module = ModalityDropout.from_args(args)
+    module.train()
+
+    print(f"Config: modalities={module.modalities}, p_drop={module.p_drop}, "
+          f"alpha_min={module.alpha_min}, total_epochs={module.total_epochs}")
+    print(f"Alpha à epoch {args.epoch}: {module.get_alpha(args.epoch):.3f}")
+
+    dummy = {m: torch.rand(2, 3, args.img_size, args.img_size) for m in module.modalities}
+    out = module(dummy, epoch=args.epoch)
+    for m, t in out.items():
+        print(f"  {m}: shape={tuple(t.shape)}, mean={t.mean():.4f}")
