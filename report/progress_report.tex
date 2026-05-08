@@ -1,0 +1,141 @@
+\documentclass[10pt,conference,compsocconf]{IEEEtran}
+
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{booktabs}
+
+\begin{document}
+\title{Sensor-Robust Multimodal VLA via Modality-Dropout Adapter Training on SmolVLA}
+
+\author{
+  Alix Papadatos (SCIPER1), Florian Tanguy (SCIPER2), Mario Fern\'andez (SCIPER3), Tomas Garate Anderegg (SCIPER4)\\
+  \textit{CS-503 Project Progress Report \{1\}}
+}
+
+\maketitle
+
+
+% ---------- Milestone Progress ----------
+\section{Milestone Progress}
+
+\subsection{Problem and Motivation}
+
+State-of-the-art Vision-Language-Action (VLA) models such as SmolVLA and $\pi_0$ rely almost exclusively on RGB perception. This single-modality dependence causes catastrophic performance degradation under sensor failure — a critical limitation for deployment in real robotic systems. Our project proposes a training strategy that builds robustness by (1) replacing SmolVLA's SigLIP encoder with the frozen \textbf{4M-21} multimodal encoder, capable of fusing RGB, depth, segmentation, and thermal inputs, and (2) training under a \textbf{modality-dropout curriculum} that progressively forces the model to operate under missing sensors.
+
+\subsection{Architecture Implementation}
+
+The full pipeline is structured into two blocks:
+
+\textbf{Block 1 — Perception.} Given RGB, depth, and segmentation frames, Block 1 synthesizes a thermal image from RGB using \textbf{ThermalGen}~\cite{xiao2025thermalgen}, a diffusion-based RGB-to-thermal model. A modality dropout module then stochastically zeros out individual modalities with probability $p_{\text{drop}}$, which increases linearly from 0 to 0.5 over training (curriculum schedule). The thermal image is embedded into a 1024-dimensional vector via the frozen \textbf{ImageBind} encoder~\cite{girdhar2023imagebind}, producing a representation natively compatible with 4M-21's token format.
+
+\textbf{Block 2 — Action.} The four modalities (RGB, depth, seg, thermal embedding) are passed through the frozen \textbf{4M-21 XL} encoder~\cite{bachmann2024fourm}, which outputs a sequence of $(B, 196, D)$ multimodal tokens. A trainable \textbf{MLP connector} (LLaVA-1.5 style, two linear layers with GELU activation) projects these tokens into SmolLM2's embedding space. The projected tokens, concatenated with language and robot state tokens, condition the \textbf{SmolVLA} action expert~\cite{shukor2025smolvla} to generate continuous 7-DoF action chunks.
+
+The freeze strategy follows a two-stage training plan:
+\begin{itemize}
+    \item \textbf{Stage 1:} Only the MLP connector is trained. All other components (ThermalGen, ImageBind, 4M-21, SmolVLM, action expert) are frozen. This aligns the 4M-21 feature space with SmolLM2's expected token distribution.
+    \item \textbf{Stage 2:} The MLP connector, SmolVLM language model, and action expert are fine-tuned with LoRA adapters under the full modality-dropout curriculum.
+\end{itemize}
+
+\subsection{Dataset Construction}
+
+We use the \texttt{binhng/libero\_10\_lerobot\_mask\_depth} dataset~\cite{fei2025libero}, a LeRobot-formatted version of the LIBERO benchmark providing aligned RGB, depth, and semantic segmentation at each timestep. The dataset consists of 500 Parquet shards ($\sim$100k frames across 10 task suites).
+
+Since no real thermal data exists for LIBERO, we constructed a thermal augmentation pipeline (\texttt{utils/thermal\_pipeline.py}) that:
+\begin{enumerate}
+    \item Reads each RGB frame from the Parquet shards.
+    \item Runs ThermalGen (\texttt{xjh19972/ThermalGen-XL-2}) to synthesize a corresponding thermal image.
+    \item Appends the result as a new \texttt{observation.images.thermal} column in the Parquet file, keeping all modalities time-aligned.
+    \item Saves the enriched shard to a separate output directory on the cluster scratch filesystem.
+\end{enumerate}
+
+To reduce generation time from an estimated $\sim$100 hours (single image, sequential) to $\sim$13 hours, we applied two optimizations: (1) \textbf{batch processing} (batch size 16 per GPU forward pass), and (2) \textbf{parallel SLURM array jobs} (4 concurrent GPU jobs, each processing a disjoint subset of shards using round-robin assignment). The thermal pipeline is currently running on the IZAR cluster.
+
+\subsection{Integration Tests}
+
+Four sanity-check scripts were written and validated:
+
+\begin{itemize}
+    \item \texttt{test\_block1.py} — verifies ThermalGen inference and ImageBind embedding on a real image, checking output shape $(B, 1024)$.
+    \item \texttt{test\_block2.py} — runs a full Block 2 forward pass (4M-21 + MLP + SmolVLA) with a pre-encoded thermal embedding and confirms action output shape $(B, 64, 7)$.
+    \item \texttt{test\_pipeline.py} — end-to-end forward pass through the full pipeline (Block 1 + Block 2), confirming correct data flow between both blocks.
+    \item \texttt{test\_dropout.py} — verifies the curriculum dropout schedule, checking that $p_{\text{drop}}$ increases correctly as a function of training progress.
+\end{itemize}
+
+All four tests pass successfully on the IZAR GPU cluster.
+
+\subsection{Cluster Compatibility}
+
+Setting up the environment on IZAR (EPFL HPC cluster) required resolving several compatibility issues:
+
+\begin{itemize}
+    \item \textbf{CUDA version mismatch:} The V100 nodes on IZAR run CUDA 12.2 (driver 535), which is incompatible with PyTorch \texttt{+cu128}. We switched to \texttt{torch==2.7.0+cu126}.
+    \item \textbf{Missing dependencies:} ThermalGen requires \texttt{diffusers}, \texttt{timm}, and \texttt{torchdiffeq}, which are not declared in any project \texttt{requirements.txt}. ImageBind requires \texttt{iopath} and \texttt{pytorchvideo}.
+    \item \textbf{pytorchvideo API break:} \texttt{torchvision.transforms.functional\_tensor} was removed in recent torchvision versions. A one-line patch to \texttt{augmentations.py} was required.
+    \item \textbf{Disk quota:} The IZAR home filesystem has a strict quota. All dataset files are stored on the scratch filesystem (\texttt{/scratch/izar/\$USER/}).
+    \item \textbf{HuggingFace rate limiting:} Parallel jobs downloading models simultaneously triggered HTTP 429 errors. Resolved by authenticating with \texttt{HF\_TOKEN} and pre-caching model weights before launching array jobs.
+\end{itemize}
+
+A full setup guide for IZAR (\texttt{SETUP\_IZAR.md}) was written and committed to the repository.
+
+
+% ---------- Discussion & Next Steps ----------
+\section{Discussion \& Next Steps}
+
+\subsection{What Worked}
+
+The modular architecture (Block 1 / Block 2) proved effective for development and testing: each block can be validated independently before running the full pipeline. The 4M-21 encoder's native support for thermal embeddings via ImageBind avoided any architectural surgery on SmolVLA's vision backbone. The two-stage training strategy is well-supported by the existing \texttt{freeze\_*} flags in the training scripts.
+
+\subsection{Challenges}
+
+The main challenge encountered was the absence of real thermal data for robotic manipulation. ThermalGen mitigates this, but introduces a computational bottleneck: generating synthetic thermal for $\sim$100k frames takes $\sim$13 hours across 4 GPUs. Additionally, the diffusion-based generation adds stochasticity — the same RGB frame may produce slightly different thermal outputs across runs, which could affect training stability.
+
+A secondary challenge is version fragility: the combination of LeRobot 0.5.2, 4M-21, ImageBind, and ThermalGen involves many conflicting dependency declarations, requiring careful use of \texttt{--no-deps} installation and manual patches.
+
+\subsection{Next Steps}
+
+\begin{enumerate}
+    \item \textbf{Complete thermal dataset generation} — the SLURM array job is currently processing all 500 shards; expected completion within 13 hours.
+    \item \textbf{Stage 1 training} — train the MLP connector for 10,000 steps on the enriched LIBERO dataset with all other components frozen.
+    \item \textbf{Stage 2 training} — fine-tune with LoRA adapters under the modality-dropout curriculum.
+    \item \textbf{Evaluation} — benchmark on the four LIBERO task suites (Spatial, Object, Goal, Long) under clean, hard-dropout, and soft-corruption conditions, and compare against vanilla SmolVLA (87.3\% avg. task completion).
+    \item \textbf{Ablations} — evaluate (a) the contribution of additional modalities vs. RGB-only, and (b) curriculum vs. fixed dropout schedule.
+\end{enumerate}
+
+
+% ---------- Author Contribution Statement ----------
+\section{Author Contribution Statement}
+
+\textbf{Alix Papadatos} designed and implemented Block 2 (4M-21 encoder wrapper, MLP connector), and contributed to the integration tests.
+
+\textbf{Florian Tanguy} designed and implemented the modality dropout curriculum module and contributed to the training scripts.
+
+\textbf{Mario Fern\'andez} designed and implemented Block 1 (ThermalGen wrapper, ImageBind encoder) and the thermal dataset generation pipeline.
+
+\textbf{Tomas Garate Anderegg} led the cluster setup and environment configuration on IZAR, implemented the parallel thermal generation SLURM pipeline, and contributed to the full pipeline integration and end-to-end tests.
+
+All authors contributed equally to the overall architecture design, code review, and project planning.
+
+
+% ---------- Bibliography ----------
+\bibliographystyle{IEEEtran}
+\begin{thebibliography}{9}
+
+\bibitem{fei2025libero}
+S.\ Fei et al., ``LIBERO: Benchmarking Knowledge Transfer for Lifelong Robot Learning,'' \textit{arXiv:2306.03310}, 2023.
+
+\bibitem{bachmann2024fourm}
+R.\ Bachmann et al., ``4M-21: An Any-to-Any Vision Model for Tens of Tasks and Modalities,'' \textit{arXiv:2406.09406}, 2024.
+
+\bibitem{shukor2025smolvla}
+M.\ Shukor et al., ``SmolVLA: A Vision-Language-Action Model for Affordable and Efficient Robotics,'' \textit{arXiv:2506.01844}, 2025.
+
+\bibitem{girdhar2023imagebind}
+R.\ Girdhar et al., ``ImageBind: One Embedding Space To Bind Them All,'' \textit{CVPR}, 2023.
+
+\bibitem{xiao2025thermalgen}
+J.\ Xiao et al., ``ThermalGen: Scalable Thermal Image Generation,'' \textit{NeurIPS}, 2025.
+
+\end{thebibliography}
+
+\end{document}
