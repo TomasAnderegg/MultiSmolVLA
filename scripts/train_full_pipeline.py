@@ -31,6 +31,8 @@ import logging
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "third_party", "lerobot", "src"))
 
+from src.pipeline.modality_dropout import ModalityDropout
+
 import torch
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
@@ -78,6 +80,16 @@ def parse_args():
     parser.add_argument("--log_every", type=int, default=50)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--max_lang_tokens", type=int, default=48)
+    parser.add_argument("--chunk_size", type=int, default=50,
+                        help="Number of future action steps per training sample (must match SmolVLA chunk_size)")
+
+    # Logging
+    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
+    parser.add_argument("--wandb_project", type=str, default="multismolvla")
+    parser.add_argument("--wandb_run_name", type=str, default=None)
+
+    # ModalityDropout flags (p_drop, alpha_min, total_epochs, modalities, corruption_types)
+    ModalityDropout.add_args(parser)
 
     return parser.parse_args()
 
@@ -168,6 +180,7 @@ def make_batch(sample, args, tokenizer, device, has_precomputed_modalities=False
         "observation.language.tokens": tokenized["input_ids"].to(device),
         "observation.language.attention_mask": tokenized["attention_mask"].to(device),
         "action": actions,
+        "action_is_pad": sample["action_is_pad"].to(device),
     }
 
     return inputs, batch
@@ -194,7 +207,7 @@ def main():
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
         from utils.parquet_dataset import ParquetThermalDataset
         log.info(f"Loading pre-generated parquet dataset from: {args.data_dir}")
-        dataset = ParquetThermalDataset(args.data_dir)
+        dataset = ParquetThermalDataset(args.data_dir, chunk_size=args.chunk_size)
         has_precomputed_modalities = True
     else:
         from lerobot.datasets import LeRobotDataset
@@ -222,28 +235,36 @@ def main():
         use_4m=True,
         freeze_4m=False,
         freeze_mlp=False,
+        p_drop=args.p_drop,
+        alpha_min=args.alpha_min,
+        total_epochs=args.total_epochs,
+        modalities=args.modalities,
+        corruption_types=args.corruption_types,
         device=device,
     )
     pipeline.train()
 
-    # Applying different LR for the MLP and the SmolVLM
+    # Apply freeze flags first so optimizer only tracks trainable params
+    apply_freeze_flags(pipeline, args)
+
     vlm_with_expert = pipeline.block2.smolvla.policy.base_policy.model.vlm_with_expert
     mlp_params = set(vlm_with_expert.fourm_to_vlm.parameters())
 
-    other_params = [p for p in pipeline.parameters()
-                if p.requires_grad and p not in mlp_params]
-
     mlp_trainable = [p for p in mlp_params if p.requires_grad]
-
-    apply_freeze_flags(pipeline, args)
+    other_params   = [p for p in pipeline.parameters()
+                      if p.requires_grad and p not in mlp_params]
 
     optimizer = torch.optim.AdamW([
-        {'params': other_params, 'lr':args.lr},
-        {'params': mlp_trainable, 'lr':args.lr_mlp}
-    ]
-    )
+        {'params': other_params,  'lr': args.lr},
+        {'params': mlp_trainable, 'lr': args.lr_mlp},
+    ])
 
     os.makedirs(args.output_dir, exist_ok=True)
+
+    if args.wandb:
+        import wandb
+        wandb.init(project=args.wandb_project, name=args.wandb_run_name, config=vars(args))
+        log.info(f"WandB run: {wandb.run.url}")
 
     log.info("Starting training ...")
     step = 0
@@ -269,6 +290,9 @@ def main():
             if step % args.log_every == 0:
                 avg = running_loss / args.log_every
                 log.info(f"step={step}/{args.steps}  loss={avg:.4f}")
+                if args.wandb:
+                    import wandb
+                    wandb.log({"loss": avg, "step": step})
                 running_loss = 0.0
 
             if step % args.save_every == 0:
@@ -279,6 +303,10 @@ def main():
     ckpt = os.path.join(args.output_dir, "pipeline_final.pt")
     torch.save(pipeline.state_dict(), ckpt)
     log.info(f"Training done. Final checkpoint: {ckpt}")
+
+    if args.wandb:
+        import wandb
+        wandb.finish()
 
 
 if __name__ == "__main__":

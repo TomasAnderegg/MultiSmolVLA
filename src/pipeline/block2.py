@@ -52,4 +52,5 @@ class Block2(nn.Module):
         """Training: returns loss dict from SmolVLA policy."""
         smol_batch = dict(batch)
         smol_batch["observation.images.4m"] = inputs
-        return self.smolvla.policy.forward(smol_batch)
+        loss, loss_dict = self.smolvla.policy.forward(smol_batch)
+        return {"loss": loss, **loss_dict}

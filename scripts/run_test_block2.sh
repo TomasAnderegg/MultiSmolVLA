@@ -10,7 +10,8 @@
 nvidia-smi
 
 eval "$(conda shell.bash hook)"
-conda activate $SCRATCH/envs/multismolvla
+conda activate lerobot
+
 
 cd /home/garate/MultiSmolVLA
 

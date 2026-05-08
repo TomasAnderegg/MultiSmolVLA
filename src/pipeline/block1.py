@@ -16,11 +16,20 @@ class Block1(nn.Module):
         self,
         device: str = "cuda",
         p_drop: float = 0.5,
+        alpha_min: float = 0.0,
         total_epochs: int = 100,
+        modalities: list = None,
+        corruption_types: list = None,
     ):
         super().__init__()
         self.thermalgen = ThermalGenWrapper(device=device)
-        self.dropout    = ModalityDropout(p_drop=p_drop, total_epochs=total_epochs)
+        self.dropout = ModalityDropout(
+            modalities=modalities or ["rgb", "depth", "seg", "thermal"],
+            p_drop=p_drop,
+            alpha_min=alpha_min,
+            total_epochs=total_epochs,
+            corruption_types=corruption_types or ["gaussian", "blur", "occlusion"],
+        )
         self.imagebind  = ImageBindThermalEncoder(device=device)
 
     def forward(self, inputs: dict, epoch: int = 0) -> dict:

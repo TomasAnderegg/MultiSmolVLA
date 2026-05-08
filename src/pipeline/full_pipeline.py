@@ -19,12 +19,22 @@ class VLAPipeline(nn.Module):
         freeze_4m: bool = True,
         freeze_mlp: bool = False,
         p_drop: float = 0.5,
+        alpha_min: float = 0.0,
         total_epochs: int = 100,
+        modalities: list = None,
+        corruption_types: list = None,
         device: str = "cuda",
     ):
         super().__init__()
         self.device = device
-        self.block1 = Block1(device=device, p_drop=p_drop, total_epochs=total_epochs)
+        self.block1 = Block1(
+            device=device,
+            p_drop=p_drop,
+            alpha_min=alpha_min,
+            total_epochs=total_epochs,
+            modalities=modalities,
+            corruption_types=corruption_types,
+        )
         self.block2 = Block2(
             smolvla_checkpoint=smolvla_checkpoint,
             fourm_checkpoint=fourm_checkpoint,
