@@ -19,7 +19,7 @@ State-of-the-art Vision-Language-Action (VLA) models rely mostly on RGB percepti
 
 ## Pipeline
 
-![Pipeline](assets/general_pipeline.drawio.png)
+![Pipeline](general_pipeline.drawio.png)
 
 *Block 1 (Perception): Four input modalities (RGB, depth, segmentation, thermal) pass through a modality-dropout layer during training. Thermal is synthesized from RGB via ThermalGen and embedded through ImageBind into a format natively supported by 4M-21. The frozen 4M-21 encoder fuses all available modalities into a unified token sequence.*
 

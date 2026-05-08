@@ -25,15 +25,8 @@ conda activate /scratch/izar/$USER/envs/multismolvla
 cd /home/$USER/MultiSmolVLA
 
 # Path to the pre-generated parquet_thermal dataset
+# Change this to wherever Tomas copied the data for you
 DATA_DIR="/scratch/izar/$USER/data/parquet_thermal"
-
-# Download dataset from HuggingFace if not already present
-if [ ! "$(ls -A $DATA_DIR 2>/dev/null)" ]; then
-    echo "Dataset not found at $DATA_DIR, downloading from HuggingFace..."
-    DATA_DIR_THERMAL=$DATA_DIR python data/download_thermal_dataset.py
-else
-    echo "Dataset found at $DATA_DIR ($(ls $DATA_DIR | wc -l) shards)"
-fi
 
 echo "Job started at $(date)"
 echo "Node: $(hostname)"
