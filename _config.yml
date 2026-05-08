@@ -1,0 +1,9 @@
+exclude:
+  - third_party/
+  - report/
+  - scripts/
+  - src/
+  - data/
+  - utils/
+  - docs/
+  - README.md
