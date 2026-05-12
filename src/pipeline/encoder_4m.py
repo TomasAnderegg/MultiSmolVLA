@@ -30,7 +30,12 @@ class Encoder4M(nn.Module):
         self.device = device
         self.dtype = dtype
         print(f"[Encoder4M] Loading 4M-21 from {checkpoint} ({dtype}) ...")
-        self.model = FM.from_pretrained(checkpoint)
+        try:
+            self.model = FM.from_pretrained(checkpoint, local_files_only=True)
+            print("[Encoder4M] Loaded from local cache")
+        except Exception:
+            print("[Encoder4M] Not in cache — downloading from Hub ...")
+            self.model = FM.from_pretrained(checkpoint, local_files_only=False)
         self.model.to(device=device, dtype=dtype)
         self.model.eval()
         for p in self.model.parameters():
