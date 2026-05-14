@@ -287,7 +287,7 @@ def eval_task(task_id, vec_env, pipeline, env_preprocessor, tokenizer, device, a
     successes: list[bool] = []
     while len(successes) < args.n_episodes:
         ep = run_episode(vec_env, pipeline, env_preprocessor, tokenizer, device, args, corruptor)
-
+        successes.extend(ep)
     successes = successes[: args.n_episodes]
     sr = float(np.mean(successes)) * 100
     log.info(f"  task_id={task_id} → {sr:.1f}%  ({args.n_episodes} episodes)")
