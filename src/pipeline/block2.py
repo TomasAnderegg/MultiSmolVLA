@@ -53,4 +53,4 @@ class Block2(nn.Module):
         smol_batch = dict(batch)
         smol_batch["observation.images.4m"] = inputs
         loss, loss_dict = self.smolvla.policy.forward(smol_batch)
-        return {"loss": loss, **loss_dict}
+        return {"loss": loss, **{k: v for k, v in loss_dict.items() if k != "loss"}}

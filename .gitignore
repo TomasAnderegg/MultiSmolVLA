@@ -4,10 +4,15 @@ data/parquet_scratch
 data/parquet_scratch/
 data/parquet_thermal/
 models/
+checkpoints/
 *.parquet
+*.pt
+*.pth
+*.safetensors
 
 # Logs
 logs/
+wandb/
 scripts/logs/
 *.out
 
