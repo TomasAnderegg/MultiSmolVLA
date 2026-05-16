@@ -5,8 +5,11 @@ Evaluate the MultiSmolVLA pipeline on LIBERO environments.
 Replaces the baseline SmolVLA policy with our full multimodal pipeline:
   RGB → Block1 (ThermalGen + ImageBind) → Block2 (4M + MLP + SmolVLA) → Actions
 
-Depth and segmentation are not available from LIBERO at eval time, so zero tensors
-are passed for those modalities — ThermalGen only needs the RGB image to produce thermal.
+Depth and segmentation are obtained from the LIBERO/robosuite simulator by subclassing
+LiberoEnv to override _ensure_env() (which hardcodes the OffScreenRenderEnv kwargs) and
+_format_raw_obs() (which drops all non-RGB keys).  The subclass is injected into the
+vec_env slot list after make_env() but before the first reset(), which is safe because
+LiberoEnv creates its OffScreenRenderEnv lazily on first reset().
 
 Usage:
   # Evaluate all tasks in a suite (10 episodes each):
@@ -49,10 +52,278 @@ from lerobot.envs.configs import LiberoEnv as LiberoEnvCfg  # the dataclass conf
 from src.pipeline.full_pipeline import VLAPipeline
 from src.pipeline.modality_dropout import ModalityDropout, AVAILABLE_MODALITIES, AVAILABLE_CORRUPTIONS
 
+# ---------------------------------------------------------------------------
+# Robosuite 1.4.x segmentation overflow fix
+# ---------------------------------------------------------------------------
+# binding_utils.read_pixels() encodes the segmentation ID as:
+#   seg = rgb[:,:,0] + rgb[:,:,1]*256 + rgb[:,:,2]*65536
+# on a uint8 ndarray, which raises OverflowError.  The fix is to cast to
+# int32 before the arithmetic.  We must apply this BEFORE any OffScreenRenderEnv
+# is constructed because robosuite validates the segmentation sensor during
+# __init__ by calling read_pixels(), and that is what triggers the crash.
+def _apply_robosuite_seg_patch():
+    """Fix robosuite 1.4.x OverflowError in binding_utils.read_pixels().
+
+    The crash is:
+        seg_img = rgb_img[:,:,0] + rgb_img[:,:,1]*(2**8) + rgb_img[:,:,2]*(2**16)
+    where rgb_img is uint8, so *256 overflows.
+
+    The call chain is:
+        robot_env.py camera_segmentation sensor
+          -> self.sim.render(..., segmentation=True)
+             -> read_pixels(..., segmentation=True)   # <-- crashes here
+          -> seg = result[::convention, :, 1]         # expects (H,W,3) uint8
+
+    So read_pixels must return a plain (H,W,3) uint8 array — the packed render
+    buffer — with seg IDs encoded across the three colour channels.  We cannot
+    return a decoded seg ID array or a tuple; the caller does its own slicing.
+
+    Fix: call _orig with segmentation=False to get the raw RGB buffer without
+    triggering the overflow, decode the IDs with int32 arithmetic, then RE-PACK
+    them back into a (H,W,3) uint8 array in the same channel layout so the
+    caller's slicing (channel index 1) still extracts the correct values.
+    """
+    import robosuite.utils.binding_utils as _bu
+
+    ctx_cls = getattr(_bu, "MjRenderContextOffscreen",
+               getattr(_bu, "MjRenderContext", None))
+    if ctx_cls is None:
+        log.warning("Could not locate MjRenderContext class -- seg patch skipped.")
+        return
+
+    _orig = ctx_cls.read_pixels
+
+    def _patched_read_pixels(self, width, height, *, depth=False, segmentation=False):
+        if not segmentation:
+            return _orig(self, width, height, depth=depth, segmentation=segmentation)
+
+        # Get the raw packed-RGB render buffer without the crashing decode step.
+        base    = _orig(self, width, height, depth=depth, segmentation=False)
+        rgb_img = base[0] if depth else base   # (H, W, 3) uint8
+
+        # Decode with int32 — no overflow.
+        rgb32   = rgb_img.astype(np.int32)
+        seg_ids = (rgb32[:, :, 0]
+                   + rgb32[:, :, 1] * (2**8)
+                   + rgb32[:, :, 2] * (2**16))   # (H, W) int32
+
+        # Re-pack into (H, W, 3) uint8 so robot_env.py:
+        #   seg = result[::convention, :, 1]
+        # still reads the correct mid-byte channel.
+        packed = np.zeros((*rgb_img.shape[:2], 3), dtype=np.uint8)
+        packed[:, :, 0] = (seg_ids & 0x0000FF).astype(np.uint8)
+        packed[:, :, 1] = ((seg_ids & 0x00FF00) >> 8).astype(np.uint8)
+        packed[:, :, 2] = ((seg_ids & 0xFF0000) >> 16).astype(np.uint8)
+
+        if depth:
+            return packed, base[1]
+        return packed
+
+    ctx_cls.read_pixels = _patched_read_pixels
+    log.info("Applied robosuite seg patch to %s.read_pixels (int32 decode + repack)",
+             ctx_cls.__name__)
+
+
+# ---------------------------------------------------------------------------
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-_IMAGE_SIZE = 224  # ThermalGen and ImageBind both expect 224×224
+_apply_robosuite_seg_patch()
+
+_IMAGE_SIZE   = 224    # ThermalGen and ImageBind both expect 224x224
+_DEPTH_NEAR   = 0.01   # metres -- must match robosuite camera near-clip
+_DEPTH_FAR    = 10.0   # metres -- must match robosuite camera far-clip
+_CAMERA_NAME  = "agentview"
+
+
+def depth_buf_to_meters(depth_buf: torch.Tensor) -> torch.Tensor:
+    """Convert a raw MuJoCo non-linear depth buffer ([0,1]) to metric depth in metres."""
+    return _DEPTH_NEAR * _DEPTH_FAR / (_DEPTH_FAR - (_DEPTH_FAR - _DEPTH_NEAR) * depth_buf)
+
+
+# ---- LiberoEnv subclass that adds depth + segmentation ----------------------
+#
+# LiberoEnv (lerobot/envs/libero.py) has two problems that prevent depth/seg:
+#
+#   1. _ensure_env() hardcodes the OffScreenRenderEnv constructor kwargs and
+#      never passes camera_depths or camera_segmentations.
+#
+#   2. _format_raw_obs() explicitly cherry-picks only RGB, eef, gripper, and
+#      joint keys from the raw robosuite observation, so depth/seg are dropped
+#      even if robosuite produces them.
+#
+# We fix both by subclassing and overriding just those two methods.
+# The subclass instances are injected into the vec_env slot list after
+# make_env() builds it, but before the first reset() triggers _ensure_env(),
+# so the lazy init works in our favour.
+
+class LiberoEnvWithDepthSeg:
+    """Wraps a LiberoEnv to add depth and segmentation observations.
+
+    Two problems in LiberoEnv prevent depth/seg from reaching the policy:
+
+      1. _ensure_env() hardcodes the OffScreenRenderEnv constructor with no
+         camera_depths / camera_segmentations flags.
+
+      2. gymnasium's SyncVectorEnv stacks observations by iterating over
+         observation_space keys only, so any extra keys added to the obs dict
+         are silently dropped before obs_raw reaches our code.
+
+    Solution: override reset() and step() to read depth/seg directly from the
+    underlying robosuite env via _get_observations() after each call, and store
+    them as instance attributes (_last_depth, _last_seg).  extract_depth_seg()
+    reads from those attributes on each slot, bypassing the vec_env stacking.
+    """
+
+    def __init__(self, libero_env):
+        from libero.libero.envs import OffScreenRenderEnv as _OSRE
+        self._wrapped = libero_env
+        self._OSRE = _OSRE
+        self._last_depth = None   # (H,W) float32 after each reset/step
+        self._last_seg   = None   # (H,W,1) int32 after each reset/step
+        # Patch _ensure_env on the instance so depth/seg flags are passed.
+        self._wrapped._ensure_env = self._patched_ensure_env
+
+    def __getattr__(self, name):
+        return getattr(self._wrapped, name)
+
+    def _patched_ensure_env(self):
+        """Like LiberoEnv._ensure_env but enables depth and segmentation."""
+        if self._wrapped._env is not None:
+            return
+        env = self._OSRE(
+            bddl_file_name=self._wrapped._task_bddl_file,
+            camera_heights=self._wrapped.observation_height,
+            camera_widths=self._wrapped.observation_width,
+            camera_depths=True,
+            camera_segmentations="instance",
+        )
+        env.reset()
+        self._wrapped._env = env
+
+    def _cache_depth_seg(self):
+        """Read depth and seg directly from the live robosuite env and cache."""
+        rs_env = self._wrapped._env
+        if rs_env is None:
+            return
+        # _get_observations() returns the full robosuite obs dict including all
+        # camera modalities enabled at construction time (depth, seg, rgb).
+        raw = rs_env.env._get_observations()
+        self._last_depth = raw.get(f"{_CAMERA_NAME}_depth")
+        self._last_seg   = raw.get(f"{_CAMERA_NAME}_segmentation_instance")
+
+    def reset(self, **kwargs):
+        result = self._wrapped.reset(**kwargs)
+        self._cache_depth_seg()
+        return result
+
+    def step(self, action):
+        result = self._wrapped.step(action)
+        self._cache_depth_seg()
+        return result
+
+    def close(self):
+        return self._wrapped.close()
+
+    def render(self):
+        return self._wrapped.render()
+
+
+def inject_depth_seg_envs(vec_env) -> None:
+    """Swap every LiberoEnv slot in vec_env for a LiberoEnvWithDepthSeg wrapper.
+
+    Must be called AFTER make_env() and BEFORE the first reset().
+    LiberoEnv._ensure_env() is lazy (runs on first reset()), so the swap is
+    always safe as long as no reset has happened yet.
+    """
+    slots = getattr(vec_env, "envs", None)
+    if slots is None:
+        log.warning("inject_depth_seg_envs: could not find .envs on vec_env -- "
+                    "depth/seg will be zeros.")
+        return
+    for i, env in enumerate(slots):
+        if isinstance(env, LiberoEnvWithDepthSeg):
+            log.debug("Slot %d: already wrapped, skipping.", i)
+            continue
+        slots[i] = LiberoEnvWithDepthSeg(env)
+        log.info("Slot %d: injected LiberoEnvWithDepthSeg", i)
+
+
+def extract_depth_seg(vec_env, device: str):
+    """Extract depth and seg from LiberoEnvWithDepthSeg slot caches.
+
+    After each reset()/step(), every LiberoEnvWithDepthSeg slot calls
+    _cache_depth_seg() which reads from the live robosuite env directly,
+    bypassing gymnasium's SyncVectorEnv observation stacking (which only
+    copies keys defined in observation_space and drops everything else).
+
+    We iterate over vec_env.envs, read _last_depth and _last_seg from each
+    LiberoEnvWithDepthSeg slot, and stack them into (B,1,H,W) tensors.
+
+    Returns:
+        depth : (B,1,H,W) float32 tensor, metric metres
+        seg   : (B,1,H,W) float32 tensor, normalised to [0,1]
+    """
+    slots = getattr(vec_env, "envs", [])
+    depth_frames, seg_frames = [], []
+
+    for i, slot in enumerate(slots):
+        if not isinstance(slot, LiberoEnvWithDepthSeg):
+            log.warning("Slot %d is not LiberoEnvWithDepthSeg (%s) -- zeros.", i, type(slot))
+            depth_frames.append(None)
+            seg_frames.append(None)
+            continue
+        depth_frames.append(slot._last_depth)
+        seg_frames.append(slot._last_seg)
+
+    n = len(slots) or 1
+
+    def _to_tensor(arr):
+        if arr is None:
+            return None
+        if isinstance(arr, torch.Tensor):
+            return arr.float()
+        return torch.from_numpy(np.asarray(arr, dtype=np.float32))
+
+    # ---- depth ---------------------------------------------------------------
+    if any(d is not None for d in depth_frames):
+        H, W = next(d for d in depth_frames if d is not None).shape[:2]
+        stacked = torch.zeros(n, 1, H, W)
+        for i, d in enumerate(depth_frames):
+            if d is not None:
+                t = _to_tensor(d)
+                if t.dim() == 3:        # (H,W,1) -> (H,W)
+                    t = t.squeeze(-1)
+                stacked[i, 0] = t
+        depth = depth_buf_to_meters(stacked.to(device))
+        if depth.shape[-2:] != (_IMAGE_SIZE, _IMAGE_SIZE):
+            depth = F.interpolate(depth, (_IMAGE_SIZE, _IMAGE_SIZE), mode="nearest")
+    else:
+        log.warning("extract_depth_seg: no depth data in any slot -- zeros.")
+        depth = torch.zeros(n, 1, _IMAGE_SIZE, _IMAGE_SIZE, device=device)
+
+    # ---- segmentation --------------------------------------------------------
+    if any(s is not None for s in seg_frames):
+        first = next(s for s in seg_frames if s is not None)
+        H, W  = first.shape[:2]
+        stacked = torch.zeros(n, 1, H, W)
+        for i, s in enumerate(seg_frames):
+            if s is not None:
+                t = _to_tensor(s)
+                if t.dim() == 3:        # (H,W,1) -> (H,W)
+                    t = t.squeeze(-1)
+                stacked[i, 0] = t
+        seg = stacked.to(device)
+        seg_max = seg.amax(dim=(-3,-2,-1), keepdim=True).clamp(min=1.)
+        seg = seg / seg_max
+        if seg.shape[-2:] != (_IMAGE_SIZE, _IMAGE_SIZE):
+            seg = F.interpolate(seg, (_IMAGE_SIZE, _IMAGE_SIZE), mode="nearest")
+    else:
+        log.warning("extract_depth_seg: no seg data in any slot -- zeros.")
+        seg = torch.zeros(n, 1, _IMAGE_SIZE, _IMAGE_SIZE, device=device)
+
+    return depth, seg
 
 
 def parse_args():
@@ -167,6 +438,7 @@ def reset_pipeline(pipeline: VLAPipeline):
 
 def obs_to_pipeline_inputs(
     obs: dict,
+    vec_env,
     task_descriptions: list[str],
     tokenizer,
     device: str,
@@ -176,26 +448,33 @@ def obs_to_pipeline_inputs(
     Convert a lerobot-format observation (after preprocess_observation + LiberoProcessorStep)
     into the (inputs, batch) pair expected by VLAPipeline.forward().
 
+    obs     : preprocessed lerobot observation -- used for RGB and robot state.
+    vec_env : the vector env whose LiberoEnvWithDepthSeg slots hold the most
+              recent depth/seg arrays (cached directly from robosuite after each
+              reset/step, bypassing gymnasium's observation stacking).
+
     Expected obs keys:
-      "observation.images.image"  : (B, 3, H, W) float32 [0, 1]  — agentview (flipped by LiberoProcessorStep)
-      "observation.state"         : (B, 8) float32  — [eef_pos(3), eef_axisangle(3), gripper_qpos(2)]
+      "observation.images.image"  : (B, 3, H, W) float32 [0, 1]
+      "observation.state"         : (B, 8) float32
     """
     rgb = obs["observation.images.image"]  # (B, 3, H, W) [0, 1]
 
-    # Resize to 224×224 (ThermalGen + ImageBind requirement)
+    # Resize to 224x224 (ThermalGen + ImageBind requirement)
     if rgb.shape[-2] != _IMAGE_SIZE or rgb.shape[-1] != _IMAGE_SIZE:
         rgb = F.interpolate(rgb, size=(_IMAGE_SIZE, _IMAGE_SIZE), mode="bilinear", align_corners=False)
 
     B = rgb.shape[0]
     rgb = rgb.to(device)
 
-    # Depth and seg are not produced by LIBERO — zeros are fine:
-    # Block1.forward() skips ThermalGen when "thermal" is already in inputs,
-    # but here we just provide the RGB and let ThermalGen generate thermal.
+    # Depth and seg come directly from the raw robosuite observation.
+    # lerobot's preprocess_observation / LiberoProcessorStep only handle RGB and
+    # robot_state and will silently discard any other keys, so we bypass it here.
+    depth, seg = extract_depth_seg(vec_env, device)
+
     inputs = {
         "rgb":   rgb,
-        "depth": torch.zeros(B, 1, _IMAGE_SIZE, _IMAGE_SIZE, device=device),
-        "seg":   torch.zeros(B, 1, _IMAGE_SIZE, _IMAGE_SIZE, device=device),
+        "depth": depth,
+        "seg":   seg,
     }
 
     # Robot state: LiberoProcessorStep produces "observation.state" (B, 8)
@@ -233,6 +512,11 @@ def run_episode(
     corruptor: ModalityDropout | None = None,
 ) -> list[bool]:
     """Run one batched episode; return per-env success flags."""
+    # Inject LiberoEnvWithDepthSeg wrappers before the first reset.
+    # inject_depth_seg_envs checks whether the slot is already wrapped, so
+    # calling this at the start of every episode is safe (idempotent).
+    inject_depth_seg_envs(vec_env)
+
     reset_pipeline(pipeline)
     obs_raw, _ = vec_env.reset()
 
@@ -252,15 +536,14 @@ def run_episode(
         if done.all():
             break
 
-        inputs, batch = obs_to_pipeline_inputs(obs, task_descs, tokenizer, device, args.max_lang_tokens)
+        # obs_raw is the unprocessed dict/list straight from the vec_env -- it
+        # still contains depth and seg keys that preprocess_observation drops.
+        inputs, batch = obs_to_pipeline_inputs(obs, vec_env, task_descs, tokenizer, device, args.max_lang_tokens)
 
         if corruptor is not None:
             inputs = apply_eval_corruption(inputs, corruptor, args.corrupt_alpha)
 
         with torch.inference_mode():
-            # Block1: RGB → ThermalGen → ImageBind embedding
-            # Block2: {rgb, depth, seg, thermal} → 4M → MLP → SmolVLA → action
-            # SmolVLA manages an internal action-chunk queue; one action is returned per call.
             action = pipeline.forward(inputs, batch, epoch=0)  # (B, action_dim)
 
         obs_raw, _reward, terminated, truncated, info = vec_env.step(action.cpu().numpy())
