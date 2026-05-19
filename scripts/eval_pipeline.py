@@ -296,7 +296,7 @@ def extract_depth_seg(vec_env, device: str):
                 if t.dim() == 3:        # (H,W,1) -> (H,W)
                     t = t.squeeze(-1)
                 stacked[i, 0] = t
-        depth = depth_buf_to_meters(stacked.to(device))
+        depth = stacked.to(device).clamp(0.0, 1.0)  # raw MuJoCo buffer already [0,1], matches training parquet
         if depth.shape[-2:] != (_IMAGE_SIZE, _IMAGE_SIZE):
             depth = F.interpolate(depth, (_IMAGE_SIZE, _IMAGE_SIZE), mode="nearest")
     else:
@@ -532,7 +532,8 @@ def run_episode(
     done    = np.zeros(vec_env.num_envs, dtype=bool)
     success = np.zeros(vec_env.num_envs, dtype=bool)
 
-    for _ in range(max_steps):
+    _debug_printed = False
+    for step_i in range(max_steps):
         if done.all():
             break
 
@@ -545,6 +546,17 @@ def run_episode(
 
         with torch.inference_mode():
             action = pipeline.forward(inputs, batch, epoch=0)  # (B, action_dim)
+
+        # Debug: print first 3 steps of first episode
+        if not _debug_printed and step_i < 3:
+            a = action.cpu().numpy()[0]
+            s = batch["observation.state"].cpu().numpy()[0]
+            rgb_stats = inputs["rgb"][0].cpu()
+            print(f"[DEBUG] step={step_i} | action={np.round(a,3)} | state={np.round(s,3)}", flush=True)
+            print(f"[DEBUG] rgb: min={rgb_stats.min():.3f} max={rgb_stats.max():.3f} mean={rgb_stats.mean():.3f}", flush=True)
+            print(f"[DEBUG] task_desc='{task_descs[0]}'", flush=True)
+            if step_i == 2:
+                _debug_printed = True
 
         obs_raw, _reward, terminated, truncated, info = vec_env.step(action.cpu().numpy())
 

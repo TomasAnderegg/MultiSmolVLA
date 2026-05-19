@@ -13,6 +13,13 @@ checkpoints/
 # Logs
 logs/
 wandb/
+
+# Eval outputs
+outputs/
+eval_results/
+
+# Videos
+*.mp4
 scripts/logs/
 *.out
 

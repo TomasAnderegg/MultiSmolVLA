@@ -4,7 +4,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=64G
-#SBATCH --time=02:00:00
+#SBATCH --time=12:00:00
 #SBATCH --output=/home/garate/MultiSmolVLA/logs/eval_%j.out
 
 mkdir -p /home/garate/MultiSmolVLA/logs
@@ -14,19 +14,25 @@ conda activate /scratch/izar/$USER/envs/multismolvla
 
 cd /home/garate/MultiSmolVLA
 
+export PYTHONPATH="/scratch/izar/garate/LIBERO:$PYTHONPATH"
+export ROBOSUITE_LOG_FILE="/scratch/izar/$USER/robosuite.log"
+export HF_HOME="/scratch/izar/$USER/huggingface_cache"
+export HUGGINGFACE_HUB_CACHE="/scratch/izar/$USER/huggingface_cache/hub"
+
 echo "Job started at $(date)"
 nvidia-smi
 
 # ── configure ────────────────────────────────────────────────────────────────
 CHECKPOINT_DIR="/scratch/izar/$USER/checkpoints/florian"
 CHECKPOINT="$CHECKPOINT_DIR/pipeline_final.pt"
-TASK="libero_spatial"  # libero_spatial | libero_object | libero_goal | libero_10 | libero_90
-N_EPISODES=10
-OUTPUT_DIR="/scratch/izar/$USER/eval_logs/multismolvla_${TASK}"
+TASK="libero_spatial"
+N_EPISODES=1
+OUTPUT_DIR="/home/garate/MultiSmolVLA/eval_results/multismolvla_${TASK}_debug"
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Download Florian's checkpoint from HuggingFace if not already present
-if [ ! -f "$CHECKPOINT" ]; then
+if [ -n "$CHECKPOINT" ] && [ ! -f "$CHECKPOINT" ]; then
     echo "Downloading checkpoint from HuggingFace..."
     python - <<EOF
 from huggingface_hub import hf_hub_download
@@ -42,8 +48,11 @@ fi
 
 mkdir -p "$OUTPUT_DIR"
 
+CHECKPOINT_ARG=()
+[[ -n "$CHECKPOINT" ]] && CHECKPOINT_ARG=(--checkpoint "$CHECKPOINT")
+
 python scripts/eval_pipeline.py \
-    --checkpoint    "$CHECKPOINT"             \
+    "${CHECKPOINT_ARG[@]}"                    \
     --fourm_checkpoint EPFL-VILAB/4M-21_XL   \
     --fourm_dim     1024                      \
     --task          "$TASK"                   \
