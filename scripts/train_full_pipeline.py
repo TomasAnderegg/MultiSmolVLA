@@ -71,6 +71,16 @@ def parse_args():
     parser.add_argument("--freeze_smolvlm", action="store_true", help="Freeze the SmolVLM language model")
     parser.add_argument("--freeze_action_expert", action="store_true", help="Freeze the action expert")
 
+    # Resume from a full VLAPipeline checkpoint (e.g. distillation output)
+    parser.add_argument("--resume_checkpoint", type=str, default=None,
+                        help="Path to a full VLAPipeline .pt checkpoint to resume from. "
+                             "Loaded after pipeline construction, before training.")
+
+    # Distillation loss (Stage 1 alignment)
+    parser.add_argument("--distill", action="store_true",
+                        help="Use feature distillation loss (cosine SigLIP vs 4M+MLP) "
+                             "instead of action prediction loss. Recommended for Stage 1.")
+
     # Training hyperparams
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--lr_mlp", type=float, default=1e-3)
@@ -242,6 +252,13 @@ def main():
         corruption_types=args.corruption_types,
         device=device,
     )
+    if args.resume_checkpoint:
+        log.info(f"Resuming from checkpoint: {args.resume_checkpoint}")
+        state = torch.load(args.resume_checkpoint, map_location="cpu", weights_only=False)
+        state.pop("_siglip_proj.weight", None)
+        pipeline.load_state_dict(state)
+        log.info("Checkpoint loaded ✅")
+
     pipeline.train()
 
     # Apply freeze flags first so optimizer only tracks trainable params
@@ -269,6 +286,7 @@ def main():
     log.info("Starting training ...")
     step = 0
     running_loss = 0.0
+    running_extras = {}  # accumulate distill metrics
 
     while step < args.steps:
         for sample in dataloader:
@@ -277,7 +295,10 @@ def main():
 
             inputs, batch = make_batch(sample, args, tokenizer, device, has_precomputed_modalities)
 
-            loss_dict = pipeline.compute_loss(inputs, batch, epoch=step)
+            if args.distill:
+                loss_dict = pipeline.compute_distill_loss(inputs, epoch=step)
+            else:
+                loss_dict = pipeline.compute_loss(inputs, batch, epoch=step)
             loss = loss_dict["loss"]
 
             optimizer.zero_grad()
@@ -285,15 +306,30 @@ def main():
             optimizer.step()
 
             running_loss += loss.item()
+            for k, v in loss_dict.items():
+                if k != "loss":
+                    running_extras[k] = running_extras.get(k, 0.0) + float(v)
             step += 1
 
             if step % args.log_every == 0:
                 avg = running_loss / args.log_every
-                log.info(f"step={step}/{args.steps}  loss={avg:.4f}")
+                avg_extras = {k: v / args.log_every for k, v in running_extras.items()}
+
+                if args.distill:
+                    log.info(f"step={step}/{args.steps}  distill_loss={avg:.4f}"
+                             f"  norm_ratio={avg_extras.get('norm_ratio', 0):.2f}"
+                             f"  siglip_norm={avg_extras.get('siglip_norm', 0):.1f}"
+                             f"  mlp_norm={avg_extras.get('mlp_norm', 0):.1f}")
+                else:
+                    log.info(f"step={step}/{args.steps}  loss={avg:.4f}")
+
                 if args.wandb:
                     import wandb
-                    wandb.log({"loss": avg, "step": step})
+                    log_dict = {"loss": avg, "step": step, **avg_extras}
+                    wandb.log(log_dict)
+
                 running_loss = 0.0
+                running_extras = {}
 
             if step % args.save_every == 0:
                 ckpt = os.path.join(args.output_dir, f"pipeline_step{step}.pt")

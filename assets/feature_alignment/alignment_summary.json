@@ -1,0 +1,17 @@
+{
+  "n_images": 100,
+  "siglip_token_shape": [
+    100,
+    196,
+    768
+  ],
+  "mlp_token_shape": [
+    100,
+    196,
+    960
+  ],
+  "siglip_norm_mean": 36.051788330078125,
+  "mlp_norm_mean": 453.6244812011719,
+  "mean_cosine_similarity": 0.014409098774194717,
+  "cka_score": 0.40824695706830666
+}

@@ -417,6 +417,7 @@ def build_pipeline(args, device: str) -> VLAPipeline:
     if args.checkpoint is not None:
         log.info(f"Loading checkpoint: {args.checkpoint}")
         state = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+        state.pop("_siglip_proj.weight", None)  # training-only key, not part of inference pipeline
         pipeline.load_state_dict(state)
         log.info("Checkpoint loaded ✅")
     else:

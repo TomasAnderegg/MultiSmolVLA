@@ -179,7 +179,7 @@ def extract_mlp_tokens(pipeline: VLAPipeline, images: torch.Tensor,
         rgb = block1_out["rgb"]               # (B, 3, 224, 224)
 
         # 4M encoding → MLP projection
-        fourm_tokens = fourm_encoder(rgb)               # (B, N_tokens, D_4m)
+        fourm_tokens = fourm_encoder({"rgb": rgb})      # (B, N_tokens, D_4m)
         mlp_out      = mlp_connector(fourm_tokens)      # (B, N_tokens, D_vlm)
         all_tokens.append(mlp_out.float().cpu().numpy())
 
@@ -310,6 +310,7 @@ def main():
     if args.checkpoint:
         print(f"  Loading checkpoint: {args.checkpoint}")
         state = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+        state.pop("_siglip_proj.weight", None)
         pipeline.load_state_dict(state)
     pipeline.to(device)
     pipeline.eval()
