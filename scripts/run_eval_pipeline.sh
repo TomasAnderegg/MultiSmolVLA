@@ -23,10 +23,10 @@ echo "Job started at $(date)"
 nvidia-smi
 
 # ── configure ────────────────────────────────────────────────────────────────
-CHECKPOINT="/scratch/izar/$USER/checkpoints/distill_mlp/pipeline_step35000.pt"
-TASK="libero_spatial"
+CHECKPOINT="/scratch/izar/$USER/checkpoints/stage2_finetune/pipeline_final.pt"
+TASK="libero_10"
 N_EPISODES=5
-OUTPUT_DIR="/home/garate/MultiSmolVLA/eval_results/multismolvla_${TASK}_distill"
+OUTPUT_DIR="/home/garate/MultiSmolVLA/eval_results/multismolvla_${TASK}_stage2"
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -55,7 +55,6 @@ python scripts/eval_pipeline.py \
     --fourm_checkpoint EPFL-VILAB/4M-21_XL   \
     --fourm_dim     1024                      \
     --task          "$TASK"                   \
-    --task_ids      0                         \
     --n_episodes    "$N_EPISODES"             \
     --batch_size    1                         \
     --output_dir    "$OUTPUT_DIR"
