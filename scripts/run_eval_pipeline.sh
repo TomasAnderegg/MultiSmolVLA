@@ -23,10 +23,10 @@ echo "Job started at $(date)"
 nvidia-smi
 
 # ── configure ────────────────────────────────────────────────────────────────
-CHECKPOINT="/scratch/izar/$USER/checkpoints/stage2_finetune/pipeline_final.pt"
+CHECKPOINT="/scratch/izar/$USER/checkpoints/stage2_finetune_v2/pipeline_step30000.pt"
 TASK="libero_10"
 N_EPISODES=5
-OUTPUT_DIR="/home/garate/MultiSmolVLA/eval_results/multismolvla_${TASK}_stage2"
+OUTPUT_DIR="/home/garate/MultiSmolVLA/eval_results/multismolvla_${TASK}_stage2v2"
 
 # ─────────────────────────────────────────────────────────────────────────────
 
