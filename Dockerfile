@@ -1,15 +1,27 @@
-FROM pytorch/pytorch:2.7.0-cuda12.8-cudnn9-runtime
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
+# Allow pip to install into system Python on Ubuntu 24.04 (PEP 668)
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
 WORKDIR /workspace
 
 # ── System dependencies ───────────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y \
+    python3.12 python3.12-dev python3-pip \
     git git-lfs curl wget ffmpeg \
-    libgl1-mesa-glx libglib2.0-0 libsm6 libxext6 libxrender-dev \
+    libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev \
     libglu1-mesa-dev libglfw3-dev libglew-dev \
     libosmesa6-dev patchelf \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.12 /usr/bin/python \
+    && ln -sf /usr/bin/python3.12 /usr/bin/python3
+
+# ── PyTorch 2.7.0 for CUDA 12.8 ──────────────────────────────────────────────
+RUN pip install --no-cache-dir \
+    torch==2.7.0 \
+    torchvision==0.22.0 \
+    torchaudio==2.7.0 \
+    --index-url https://download.pytorch.org/whl/cu128
 
 # ── Clone MultiSmolVLA ────────────────────────────────────────────────────────
 RUN git clone --recurse-submodules https://github.com/TomasAnderegg/MultiSmolVLA.git /workspace/MultiSmolVLA
@@ -30,7 +42,16 @@ RUN pip install --no-cache-dir \
     scikit-learn \
     matplotlib \
     pyarrow \
-    tqdm
+    tqdm \
+    boto3 \
+    webdataset \
+    albumentations \
+    braceexpand \
+    pandas \
+    datasets \
+    "torchmetrics[image,multimodal]" \
+    num2words \
+    opencv-python-headless
 
 # ── LeRobot (SmolVLA) ─────────────────────────────────────────────────────────
 RUN pip install --no-cache-dir -e third_party/lerobot
@@ -40,10 +61,15 @@ RUN pip install --no-cache-dir --no-deps -e third_party/ml-4m
 
 # ── ImageBind ─────────────────────────────────────────────────────────────────
 RUN pip install --no-cache-dir --no-deps -e third_party/ImageBind && \
-    pip install --no-cache-dir pytorchvideo iopath types-regex
+    pip install --no-cache-dir pytorchvideo iopath types-regex && \
+    sed -i 's|import torchvision.transforms.functional_tensor as F_t|from torchvision.transforms import functional as F_t|g' \
+        /usr/local/lib/python3.12/dist-packages/pytorchvideo/transforms/augmentations.py
 
 # ── ThermalGen ────────────────────────────────────────────────────────────────
 RUN pip install --no-cache-dir --no-deps -e third_party/ThermalGen 2>/dev/null || true
+
+# ── Pin cmake 3.x (lerobot installs cmake 4.x which breaks egl_probe build) ──
+RUN pip install --no-cache-dir "cmake>=3.29,<4.0"
 
 # ── LIBERO (simulation environment) ──────────────────────────────────────────
 RUN git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git /workspace/LIBERO && \
@@ -66,9 +92,10 @@ f.write_text(content) if f.exists() else None"
 
 # ── Fix robosuite macros ───────────────────────────────────────────────────────
 RUN python -c "\
-import shutil, pathlib; \
-src = pathlib.Path('/opt/conda/lib/python3.12/site-packages/robosuite/macros.py'); \
-dst = pathlib.Path('/opt/conda/lib/python3.12/site-packages/robosuite/macros_private.py'); \
+import shutil, robosuite, pathlib; \
+site = pathlib.Path(robosuite.__file__).parent; \
+src = site / 'macros.py'; \
+dst = site / 'macros_private.py'; \
 shutil.copy(src, dst) if src.exists() and not dst.exists() else None"
 
 # ── Environment variables ─────────────────────────────────────────────────────

@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from .block1 import Block1
 from .block2 import Block2
 
@@ -123,4 +124,56 @@ class VLAPipeline(nn.Module):
             "norm_ratio":  norm_ratio.item(),
             "siglip_norm": siglip_norm.item(),
             "mlp_norm":    mlp_norm.item(),
+        }
+
+    def compute_joint_loss(self, inputs: dict, batch: dict, epoch: int = 0,
+                           lambda_distill: float = 0.1) -> dict:
+        """Stage 3: L_total = L_action + lambda_distill * L_distill.
+
+        Runs Block1 once and shares the output between the action loss and the
+        distillation loss so Block1 is not executed twice.
+
+        - L_action : flow-matching loss from SmolVLA (trains the full policy)
+        - L_distill: cosine loss keeping MLP tokens aligned with SigLIP tokens
+                     (prevents the MLP from drifting as the action loss optimizes it)
+        """
+        inputs = self._run_block1(inputs, epoch)
+        rgb = inputs["rgb"]  # (B, 3, 224, 224)
+
+        # ── Action loss ───────────────────────────────────────────────────────
+        action_dict = self.block2.compute_loss(inputs, batch)
+        action_loss = action_dict["loss"]
+
+        # ── Distillation loss ─────────────────────────────────────────────────
+        vlm_with_expert = self.block2.smolvla.policy.base_policy.model.vlm_with_expert
+
+        vision_model = vlm_with_expert.get_vlm_model().vision_model
+        with torch.no_grad():
+            siglip_out    = vision_model(pixel_values=rgb.to(dtype=vision_model.dtype))
+            siglip_tokens = siglip_out.last_hidden_state.float()   # (B, 196, 768)
+
+        fourm_tokens = vlm_with_expert.fourm_encoder({"rgb": rgb})
+        mlp_tokens   = vlm_with_expert.fourm_to_vlm(fourm_tokens).float()  # (B, N, D_vlm)
+
+        siglip_mean = F.normalize(siglip_tokens.mean(dim=1), dim=-1)
+        mlp_mean    = F.normalize(mlp_tokens.mean(dim=1),    dim=-1)
+
+        d_siglip, d_mlp = siglip_mean.shape[-1], mlp_mean.shape[-1]
+        if not hasattr(self, "_siglip_proj") or self._siglip_proj.weight.shape != (d_mlp, d_siglip):
+            self._siglip_proj = nn.Linear(d_siglip, d_mlp, bias=False).to(rgb.device)
+            nn.init.eye_(self._siglip_proj.weight[:min(d_mlp, d_siglip), :min(d_mlp, d_siglip)])
+            for p in self._siglip_proj.parameters():
+                p.requires_grad = False
+
+        siglip_proj  = F.normalize(self._siglip_proj(siglip_mean), dim=-1)
+        target       = torch.ones(rgb.shape[0], device=rgb.device)
+        distill_loss = F.cosine_embedding_loss(mlp_mean, siglip_proj, target)
+
+        total_loss = action_loss + lambda_distill * distill_loss
+
+        return {
+            "loss":         total_loss,
+            "action_loss":  action_loss.item(),
+            "distill_loss": distill_loss.item(),
+            "mlp_norm":     mlp_tokens.norm(dim=-1).mean().item(),
         }

@@ -84,6 +84,13 @@ def parse_args():
     # Training hyperparams
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--lr_mlp", type=float, default=1e-3)
+    parser.add_argument("--lr_action", type=float, default=1e-6,
+                        help="Learning rate for the action head (Stage 3). Very low to prevent "
+                             "catastrophic forgetting of gripper timing.")
+    parser.add_argument("--joint", action="store_true",
+                        help="Stage 3: use joint loss L_action + lambda_distill * L_distill.")
+    parser.add_argument("--lambda_distill", type=float, default=0.1,
+                        help="Weight of the distillation term in the joint loss (Stage 3).")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--steps", type=int, default=10_000)
     parser.add_argument("--save_every", type=int, default=1000)
@@ -265,15 +272,35 @@ def main():
     apply_freeze_flags(pipeline, args)
 
     vlm_with_expert = pipeline.block2.smolvla.policy.base_policy.model.vlm_with_expert
-    mlp_params = set(vlm_with_expert.fourm_to_vlm.parameters())
+    base_model      = pipeline.block2.smolvla.policy.base_policy.model
 
-    mlp_trainable = [p for p in mlp_params if p.requires_grad]
-    other_params   = [p for p in pipeline.parameters()
-                      if p.requires_grad and p not in mlp_params]
+    mlp_param_ids = {id(p) for p in vlm_with_expert.fourm_to_vlm.parameters()}
+
+    action_head_param_ids = set()
+    for component_name in ["action_in_proj", "action_out_proj",
+                            "action_time_mlp_in", "action_time_mlp_out"]:
+        component = getattr(base_model, component_name, None)
+        if component is not None:
+            action_head_param_ids.update(id(p) for p in component.parameters())
+
+    mlp_trainable         = [p for p in pipeline.parameters()
+                              if p.requires_grad and id(p) in mlp_param_ids]
+    action_head_trainable = [p for p in pipeline.parameters()
+                              if p.requires_grad and id(p) in action_head_param_ids]
+    other_params          = [p for p in pipeline.parameters()
+                              if p.requires_grad
+                              and id(p) not in mlp_param_ids
+                              and id(p) not in action_head_param_ids]
+
+    log.info(f"Optimizer groups: "
+             f"mlp={sum(p.numel() for p in mlp_trainable):,} params @ lr={args.lr_mlp}  |  "
+             f"action_head={sum(p.numel() for p in action_head_trainable):,} params @ lr={args.lr_action}  |  "
+             f"other={sum(p.numel() for p in other_params):,} params @ lr={args.lr}")
 
     optimizer = torch.optim.AdamW([
-        {'params': other_params,  'lr': args.lr},
-        {'params': mlp_trainable, 'lr': args.lr_mlp},
+        {'params': other_params,          'lr': args.lr},
+        {'params': mlp_trainable,         'lr': args.lr_mlp},
+        {'params': action_head_trainable, 'lr': args.lr_action},
     ])
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -297,6 +324,9 @@ def main():
 
             if args.distill:
                 loss_dict = pipeline.compute_distill_loss(inputs, epoch=step)
+            elif args.joint:
+                loss_dict = pipeline.compute_joint_loss(
+                    inputs, batch, epoch=step, lambda_distill=args.lambda_distill)
             else:
                 loss_dict = pipeline.compute_loss(inputs, batch, epoch=step)
             loss = loss_dict["loss"]
@@ -319,6 +349,11 @@ def main():
                     log.info(f"step={step}/{args.steps}  distill_loss={avg:.4f}"
                              f"  norm_ratio={avg_extras.get('norm_ratio', 0):.2f}"
                              f"  siglip_norm={avg_extras.get('siglip_norm', 0):.1f}"
+                             f"  mlp_norm={avg_extras.get('mlp_norm', 0):.1f}")
+                elif args.joint:
+                    log.info(f"step={step}/{args.steps}  total_loss={avg:.4f}"
+                             f"  action={avg_extras.get('action_loss', 0):.4f}"
+                             f"  distill={avg_extras.get('distill_loss', 0):.4f}"
                              f"  mlp_norm={avg_extras.get('mlp_norm', 0):.1f}")
                 else:
                     log.info(f"step={step}/{args.steps}  loss={avg:.4f}")
