@@ -90,12 +90,6 @@ content = f.read_text() if f.exists() else ''; \
 content = content.replace('field(init=False, metadata=', 'field(init=False, default=None, metadata='); \
 f.write_text(content) if f.exists() else None"
 
-# ── Fix pytorchvideo compatibility with torchvision >= 0.16 ──────────────────
-RUN python -c "\
-import pathlib, torchvision; \
-shim = pathlib.Path(torchvision.__file__).parent / 'transforms' / 'functional_tensor.py'; \
-shim.write_text('from torchvision.transforms.functional import *\n') if not shim.exists() else None"
-
 # ── Fix robosuite macros ───────────────────────────────────────────────────────
 RUN python -c "\
 import shutil, robosuite, pathlib; \
