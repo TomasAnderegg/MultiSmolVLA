@@ -37,6 +37,9 @@ import torch
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
+import torch.nn as nn
+import torch.nn.functional as F
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
@@ -105,6 +108,15 @@ def parse_args():
     parser.add_argument("--wandb_project", type=str, default="multismolvla")
     parser.add_argument("--wandb_run_name", type=str, default=None)
 
+    # LoRA flags
+    parser.add_argument("--lora", action="store_true",
+                        help="Apply LoRA adapters to the SmolVLM backbone. "
+                             "Base weights are frozen; only adapters + MLP are trained. "
+                             "Use with --freeze_action_expert to prevent gripper collapse.")
+    parser.add_argument("--lora_r", type=int, default=16, help="LoRA rank (default 16)")
+    parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha (default 32)")
+    parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout")
+
     # ModalityDropout flags (p_drop, alpha_min, total_epochs, modalities, corruption_types)
     ModalityDropout.add_args(parser)
 
@@ -157,6 +169,31 @@ def apply_freeze_flags(pipeline, args):
     trainable = sum(p.numel() for p in pipeline.parameters() if p.requires_grad)
     total = sum(p.numel() for p in pipeline.parameters())
     log.info(f"Trainable params: {trainable:,} / {total:,} ({100*trainable/total:.1f}%)")
+
+
+def apply_lora(pipeline, args):
+    """Wrap the SmolVLM backbone attention layers with LoRA adapters.
+
+    Only the LoRA delta weights are trainable; original weights stay frozen.
+    This lets the backbone adapt to new tasks without catastrophic forgetting.
+    """
+    from peft import LoraConfig, get_peft_model
+
+    vlm_with_expert = pipeline.block2.smolvla.policy.base_policy.model.vlm_with_expert
+    vlm_model = vlm_with_expert.get_vlm_model()
+
+    lora_config = LoraConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        lora_dropout=args.lora_dropout,
+        bias="none",
+    )
+    get_peft_model(vlm_model, lora_config)
+
+    lora_params = sum(p.numel() for p in vlm_model.parameters() if p.requires_grad)
+    log.info(f"LoRA applied to SmolVLM backbone: r={args.lora_r}, alpha={args.lora_alpha} | "
+             f"trainable LoRA params: {lora_params:,}")
 
 
 def make_batch(sample, args, tokenizer, device, has_precomputed_modalities=False):
@@ -270,6 +307,9 @@ def main():
 
     # Apply freeze flags first so optimizer only tracks trainable params
     apply_freeze_flags(pipeline, args)
+
+    if args.lora:
+        apply_lora(pipeline, args)
 
     vlm_with_expert = pipeline.block2.smolvla.policy.base_policy.model.vlm_with_expert
     base_model      = pipeline.block2.smolvla.policy.base_policy.model

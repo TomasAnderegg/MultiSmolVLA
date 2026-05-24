@@ -33,7 +33,7 @@ export HUGGINGFACE_HUB_CACHE="/scratch/izar/$USER/huggingface_cache/hub"
 DATA_DIR="/scratch/izar/$USER/data/parquet_thermal"
 OUTPUT_DIR="/scratch/izar/$USER/checkpoints/stage3_joint"
 # Start from Stage 1: MLP well-aligned, action head untouched
-STAGE1_CKPT="/scratch/izar/$USER/checkpoints/distill_mlp/pipeline_final.pt"
+STAGE1_CKPT="/scratch/izar/$USER/checkpoints/distill_mlp/pipeline_step35000.pt"
 mkdir -p "$OUTPUT_DIR"
 
 echo "Job started at $(date)"
