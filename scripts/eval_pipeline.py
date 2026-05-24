@@ -48,6 +48,7 @@ sys.path.insert(0, os.path.join(_REPO, "third_party", "lerobot", "src"))
 
 from lerobot.envs import make_env, preprocess_observation
 from lerobot.envs.configs import LiberoEnv as LiberoEnvCfg  # the dataclass config
+from lerobot.policies import make_pre_post_processors
 
 from src.pipeline.full_pipeline import VLAPipeline
 from src.pipeline.modality_dropout import ModalityDropout, AVAILABLE_MODALITIES, AVAILABLE_CORRUPTIONS
@@ -359,6 +360,9 @@ def parse_args():
     p.add_argument("--device", type=str, default=None,
                    help="cuda or cpu (auto-detected if omitted).")
 
+    p.add_argument("--no_thermal", action="store_true",
+                   help="Ablation: zero out the thermal embedding (skip ThermalGen+ImageBind).")
+
     # Eval-time modality corruption (robustness testing)
     p.add_argument("--corrupt_modalities", nargs="+", default=[], choices=AVAILABLE_MODALITIES,
                    help="Modalities to corrupt at eval time. E.g. --corrupt_modalities rgb depth. "
@@ -402,7 +406,7 @@ def apply_eval_corruption(inputs: dict, corruptor: ModalityDropout, alpha: float
 # Pipeline helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_pipeline(args, device: str) -> VLAPipeline:
+def build_pipeline(args, device: str):
     log.info("Building VLAPipeline ...")
     pipeline = VLAPipeline(
         smolvla_checkpoint=args.smolvla_checkpoint,
@@ -418,14 +422,27 @@ def build_pipeline(args, device: str) -> VLAPipeline:
         log.info(f"Loading checkpoint: {args.checkpoint}")
         state = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
         state.pop("_siglip_proj.weight", None)  # training-only key, not part of inference pipeline
-        pipeline.load_state_dict(state)
+        missing, unexpected = pipeline.load_state_dict(state, strict=False)
+        if missing:
+            log.info(f"Checkpoint partial load — {len(missing)} frozen keys not in checkpoint (expected for LoRA/MLP-only checkpoints)")
+        if unexpected:
+            log.warning(f"Unexpected keys in checkpoint: {unexpected}")
         log.info("Checkpoint loaded ✅")
     else:
         log.info("No checkpoint — using base (untrained) pipeline weights")
 
     pipeline.to(device)
     pipeline.eval()
-    return pipeline
+
+    log.info("Loading SmolVLA pre/post processors ...")
+    policy_cfg = pipeline.block2.smolvla.policy.config
+    policy_cfg.device = device
+    preprocessor, postprocessor = make_pre_post_processors(
+        policy_cfg, pretrained_path=args.smolvla_checkpoint
+    )
+    log.info("Processors loaded ✅")
+
+    return pipeline, preprocessor, postprocessor
 
 
 def reset_pipeline(pipeline: VLAPipeline):
@@ -441,60 +458,45 @@ def obs_to_pipeline_inputs(
     obs: dict,
     vec_env,
     task_descriptions: list[str],
-    tokenizer,
+    preprocessor,
     device: str,
-    max_lang_tokens: int,
 ) -> tuple[dict, dict]:
     """
-    Convert a lerobot-format observation (after preprocess_observation + LiberoProcessorStep)
-    into the (inputs, batch) pair expected by VLAPipeline.forward().
+    Convert a lerobot-format observation into (inputs, batch) for VLAPipeline.forward().
 
-    obs     : preprocessed lerobot observation -- used for RGB and robot state.
-    vec_env : the vector env whose LiberoEnvWithDepthSeg slots hold the most
-              recent depth/seg arrays (cached directly from robosuite after each
-              reset/step, bypassing gymnasium's observation stacking).
-
-    Expected obs keys:
-      "observation.images.image"  : (B, 3, H, W) float32 [0, 1]
-      "observation.state"         : (B, 8) float32
+    Applies SmolVLA's preprocessor to normalize state and tokenize language.
+    Images go through ThermalGen→ImageBind→4M (not SmolVLA's SigLIP), so only
+    state + language are preprocessed here.
     """
-    rgb = obs["observation.images.image"]  # (B, 3, H, W) [0, 1]
+    # Pick the first available RGB image key for the pipeline
+    rgb = None
+    for key in ["observation.images.image", "observation.images.camera1",
+                "observation.images.agentview_image"]:
+        if key in obs:
+            rgb = obs[key]
+            break
+    if rgb is None:
+        # fallback: use any image key
+        img_keys = [k for k in obs if k.startswith("observation.images.")]
+        if img_keys:
+            rgb = obs[img_keys[0]]
+        else:
+            raise ValueError(f"No image key found in obs. Keys: {list(obs.keys())}")
 
     # Resize to 224x224 (ThermalGen + ImageBind requirement)
     if rgb.shape[-2] != _IMAGE_SIZE or rgb.shape[-1] != _IMAGE_SIZE:
         rgb = F.interpolate(rgb, size=(_IMAGE_SIZE, _IMAGE_SIZE), mode="bilinear", align_corners=False)
-
-    B = rgb.shape[0]
     rgb = rgb.to(device)
 
-    # Depth and seg come directly from the raw robosuite observation.
-    # lerobot's preprocess_observation / LiberoProcessorStep only handle RGB and
-    # robot_state and will silently discard any other keys, so we bypass it here.
     depth, seg = extract_depth_seg(vec_env, device)
+    inputs = {"rgb": rgb, "depth": depth, "seg": seg}
 
-    inputs = {
-        "rgb":   rgb,
-        "depth": depth,
-        "seg":   seg,
+    # Apply SmolVLA preprocessor: normalizes state + tokenizes language
+    obs_for_preproc = {
+        "observation.state": obs.get("observation.state", torch.zeros(rgb.shape[0], 8)),
+        "task": task_descriptions,
     }
-
-    # Robot state: LiberoProcessorStep produces "observation.state" (B, 8)
-    state = obs.get("observation.state", torch.zeros(B, 8)).to(device)
-
-    # Tokenise task descriptions
-    tok = tokenizer(
-        task_descriptions,
-        padding="max_length",
-        truncation=True,
-        max_length=max_lang_tokens,
-        return_tensors="pt",
-    )
-
-    batch = {
-        "observation.state":                   state,
-        "observation.language.tokens":         tok["input_ids"].to(device),
-        "observation.language.attention_mask": tok["attention_mask"].to(device),
-    }
+    batch = preprocessor(obs_for_preproc)
 
     return inputs, batch
 
@@ -507,15 +509,13 @@ def run_episode(
     vec_env,
     pipeline: VLAPipeline,
     env_preprocessor,
-    tokenizer,
+    preprocessor,
+    postprocessor,
     device: str,
     args,
     corruptor: ModalityDropout | None = None,
 ) -> list[bool]:
     """Run one batched episode; return per-env success flags."""
-    # Inject LiberoEnvWithDepthSeg wrappers before the first reset.
-    # inject_depth_seg_envs checks whether the slot is already wrapped, so
-    # calling this at the start of every episode is safe (idempotent).
     inject_depth_seg_envs(vec_env)
 
     reset_pipeline(pipeline)
@@ -525,68 +525,94 @@ def run_episode(
     obs = env_preprocessor(obs)
 
     try:
-        task_descs = list(vec_env.get_attr("task_description"))
+        task_descs = list(vec_env.call("task_description"))
     except (AttributeError, NotImplementedError):
-        task_descs = ["perform the manipulation task"] * vec_env.num_envs
+        try:
+            task_descs = list(vec_env.call("task"))
+        except Exception:
+            task_descs = [""] * vec_env.num_envs
 
-    max_steps = vec_env.get_attr("_max_episode_steps")[0]
+    try:
+        max_steps = vec_env.call("_max_episode_steps")[0]
+    except Exception:
+        max_steps = 300
+
     done    = np.zeros(vec_env.num_envs, dtype=bool)
     success = np.zeros(vec_env.num_envs, dtype=bool)
 
     _debug_printed = False
+    gripper_vals: list[float] = []
+
     for step_i in range(max_steps):
         if done.all():
             break
 
-        # obs_raw is the unprocessed dict/list straight from the vec_env -- it
-        # still contains depth and seg keys that preprocess_observation drops.
-        inputs, batch = obs_to_pipeline_inputs(obs, vec_env, task_descs, tokenizer, device, args.max_lang_tokens)
+        inputs, batch = obs_to_pipeline_inputs(obs, vec_env, task_descs, preprocessor, device)
 
         if corruptor is not None:
             inputs = apply_eval_corruption(inputs, corruptor, args.corrupt_alpha)
 
         with torch.inference_mode():
-            action = pipeline.forward(inputs, batch, epoch=0)  # (B, action_dim)
+            if args.no_thermal:
+                inputs_b1 = pipeline._run_block1(inputs, epoch=0)
+                inputs_b1["thermal"] = torch.zeros_like(inputs_b1["thermal"])
+                action_raw = pipeline.block2(inputs_b1, batch)
+            else:
+                action_raw = pipeline.forward(inputs, batch, epoch=0)  # (B, action_dim)
 
-        # Debug: print first 3 steps of first episode
+        # Unnormalize actions from policy space → env space
+        action = postprocessor(action_raw)
+        a_np = action.cpu().numpy()[0]
+        gripper_vals.append(float(a_np[-1]))
+
         if not _debug_printed and step_i < 3:
-            a = action.cpu().numpy()[0]
-            s = batch["observation.state"].cpu().numpy()[0]
+            s = batch.get("observation.state", torch.zeros(1, 8)).cpu().numpy()[0]
             rgb_stats = inputs["rgb"][0].cpu()
-            print(f"[DEBUG] step={step_i} | action={np.round(a,3)} | state={np.round(s,3)}", flush=True)
-            print(f"[DEBUG] rgb: min={rgb_stats.min():.3f} max={rgb_stats.max():.3f} mean={rgb_stats.mean():.3f}", flush=True)
+            print(f"[DEBUG] step={step_i} | action={np.round(a_np,3)} | state={np.round(s,3)}", flush=True)
+            print(f"[DEBUG] rgb: min={rgb_stats.min():.3f} max={rgb_stats.max():.3f}", flush=True)
             print(f"[DEBUG] task_desc='{task_descs[0]}'", flush=True)
             if step_i == 2:
                 _debug_printed = True
 
-        obs_raw, _reward, terminated, truncated, info = vec_env.step(action.cpu().numpy())
+        obs_raw, _reward, terminated, truncated, info = vec_env.step(a_np[None])
 
         obs = preprocess_observation(obs_raw)
         obs = env_preprocessor(obs)
 
-        if "final_info" in info:
-            ep_success = np.asarray(info["final_info"].get("is_success", np.zeros(vec_env.num_envs)), dtype=bool)
-        elif "is_success" in info:
+        if "is_success" in info:
             ep_success = np.asarray(info["is_success"], dtype=bool)
+        elif "final_info" in info:
+            fi = info["final_info"]
+            ep_success = np.zeros(vec_env.num_envs, dtype=bool)
+            for i, d in enumerate(fi):
+                if isinstance(d, dict) and d.get("is_success", False):
+                    ep_success[i] = True
         else:
             ep_success = np.zeros(vec_env.num_envs, dtype=bool)
 
         success |= ep_success
         done    |= np.asarray(terminated | truncated, dtype=bool)
 
+    g_arr = np.array(gripper_vals)
+    gripper_summary = (f"min={g_arr.min():.2f} max={g_arr.max():.2f} "
+                       f"open_frac={float((g_arr > 0).mean()):.0%}")
+    print(f"[episode] steps={step_i+1} success={success.tolist()} gripper({gripper_summary})", flush=True)
     return success.tolist()
 
 
-def eval_task(task_id, vec_env, pipeline, env_preprocessor, tokenizer, device, args,
-              corruptor: ModalityDropout | None = None) -> dict:
+def eval_task(task_id, vec_env, pipeline, env_preprocessor, preprocessor, postprocessor,
+              device, args, corruptor: ModalityDropout | None = None) -> dict:
     """Evaluate one task for n_episodes; return success list and rate."""
     successes: list[bool] = []
+    ep_idx = 0
     while len(successes) < args.n_episodes:
-        ep = run_episode(vec_env, pipeline, env_preprocessor, tokenizer, device, args, corruptor)
+        ep = run_episode(vec_env, pipeline, env_preprocessor, preprocessor, postprocessor,
+                         device, args, corruptor)
         successes.extend(ep)
+        ep_idx += 1
     successes = successes[: args.n_episodes]
     sr = float(np.mean(successes)) * 100
-    log.info(f"  task_id={task_id} → {sr:.1f}%  ({args.n_episodes} episodes)")
+    print(f"[task {task_id}] → {sr:.1f}%  ({args.n_episodes} episodes)  successes={successes}", flush=True)
     return {"success_rate": sr, "successes": successes}
 
 
@@ -604,17 +630,14 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Build pipeline
-    pipeline = build_pipeline(args, device)
+    # Build pipeline + processors
+    pipeline, preprocessor, postprocessor = build_pipeline(args, device)
 
     # Eval-time corruptor (optional)
     corruptor = build_eval_corruptor(args)
     if corruptor is not None:
         log.info(f"Eval corruption: modalities={args.corrupt_modalities}  "
                  f"alpha={args.corrupt_alpha}  type={args.corrupt_type or 'random'}")
-
-    # Tokeniser (same as training)
-    tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolVLM2-500M-Video-Instruct")
 
     # Build LIBERO envs  →  {suite_name: {task_id: vec_env}}
     env_cfg = LiberoEnvCfg(
@@ -636,7 +659,8 @@ def main():
         log.info(f"\n── Suite: {suite_name}  ({len(task_envs)} tasks) ──────────────────────────")
         suite_results: dict = {}
         for task_id, vec_env in task_envs.items():
-            result = eval_task(task_id, vec_env, pipeline, env_preprocessor, tokenizer, device, args, corruptor)
+            result = eval_task(task_id, vec_env, pipeline, env_preprocessor, preprocessor, postprocessor,
+                               device, args, corruptor)
             suite_results[task_id] = result
             all_successes.extend(result["successes"])
             vec_env.close()

@@ -28,6 +28,8 @@ class Block2(nn.Module):
         freeze_mlp: bool = False,
         fourm_dim: int = 1024,
         device: str = "cuda",
+        use_depth: bool = False,
+        use_seg: bool = False,
     ):
         super().__init__()
         self.device = device
@@ -39,6 +41,8 @@ class Block2(nn.Module):
             fourm_checkpoint=fourm_checkpoint,
             fourm_dim=fourm_dim,
             device=device,
+            use_depth=use_depth,
+            use_seg=use_seg,
         )
 
     def forward(self, inputs: dict, batch: dict) -> torch.Tensor:

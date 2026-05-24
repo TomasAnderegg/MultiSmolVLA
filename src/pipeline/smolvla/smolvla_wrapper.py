@@ -16,6 +16,8 @@ class SmolVLAWrapper(nn.Module):
         fourm_checkpoint: str = "EPFL-VILAB/4M-21_XL",
         fourm_dim: int = 1024,
         device: str = "cuda",
+        use_depth: bool = False,
+        use_seg: bool = False,
     ):
         super().__init__()
         self.device = device
@@ -28,6 +30,8 @@ class SmolVLAWrapper(nn.Module):
             fourm_checkpoint=fourm_checkpoint,
             fourm_dim=fourm_dim,
             device=device,
+            use_depth=use_depth,
+            use_seg=use_seg,
         )
         self.policy.to(device)
         self.policy.eval()

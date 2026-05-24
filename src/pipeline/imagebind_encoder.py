@@ -31,5 +31,4 @@ class ImageBindThermalEncoder(nn.Module):
         with torch.no_grad():
             embeddings = self.model(inputs)
         out = embeddings[ModalityType.VISION]   # (B, 1024)
-        print(f"[ImageBind] thermal embedding shape: {out.shape}")
         return out

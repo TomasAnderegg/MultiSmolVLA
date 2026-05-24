@@ -24,6 +24,7 @@ Usage examples:
 """
 
 import argparse
+import contextlib
 import os
 import sys
 import logging
@@ -65,11 +66,23 @@ def parse_args():
     parser.add_argument("--fourm_dim", type=int, default=1024)
     parser.add_argument("--output_dir", type=str, default="checkpoints/full_pipeline")
 
+    # Skip Block1 entirely (no ThermalGen / ImageBind — faster training)
+    parser.add_argument("--no_block1", action="store_true",
+                        help="Skip Block1 (ThermalGen+ImageBind). Pass RGB directly to 4M.")
+    parser.add_argument("--use_depth", action="store_true",
+                        help="Feed depth channel into 4M via learnable PatchEmbedder (additive residual).")
+    parser.add_argument("--use_seg", action="store_true",
+                        help="Feed segmentation channel into 4M via learnable PatchEmbedder (additive residual).")
+
+    # Mixed precision
+    parser.add_argument("--bf16", action="store_true",
+                        help="Use bfloat16 autocast for forward passes (faster on A100).")
+
     # Freeze flags — Block1
     parser.add_argument("--freeze_thermalgen", action="store_true", help="Freeze ThermalGen (RGB→thermal generator)")
     parser.add_argument("--freeze_imagebind", action="store_true", help="Freeze ImageBind thermal encoder")
     # Freeze flags — Block2
-    parser.add_argument("--freeze_4m", action="store_true", help="Freeze the 4M encoder")
+    parser.add_argument("--freeze_4m", action="store_true", help="Freeze the 4M backbone (depth/seg embedders stay trainable)")
     parser.add_argument("--freeze_mlp", action="store_true", help="Freeze the MLP connector")
     parser.add_argument("--freeze_smolvlm", action="store_true", help="Freeze the SmolVLM language model")
     parser.add_argument("--freeze_action_expert", action="store_true", help="Freeze the action expert")
@@ -124,24 +137,26 @@ def parse_args():
 
 
 def apply_freeze_flags(pipeline, args):
-    # Block1 components
-    if args.freeze_thermalgen:
-        for p in pipeline.block1.thermalgen.parameters():
-            p.requires_grad = False
-        log.info("Frozen: ThermalGen")
+    # Block1 components (only if Block1 exists)
+    if not getattr(args, "no_block1", False):
+        if args.freeze_thermalgen:
+            for p in pipeline.block1.thermalgen.parameters():
+                p.requires_grad = False
+            log.info("Frozen: ThermalGen")
 
-    if args.freeze_imagebind:
-        for p in pipeline.block1.imagebind.parameters():
-            p.requires_grad = False
-        log.info("Frozen: ImageBind")
+        if args.freeze_imagebind:
+            for p in pipeline.block1.imagebind.parameters():
+                p.requires_grad = False
+            log.info("Frozen: ImageBind")
 
     # Block2 components
     vlm_with_expert = pipeline.block2.smolvla.policy.base_policy.model.vlm_with_expert
 
     if args.freeze_4m:
-        for p in vlm_with_expert.fourm_encoder.parameters():
+        # Only freeze the pretrained 4M backbone; depth/seg PatchEmbedders stay trainable
+        for p in vlm_with_expert.fourm_encoder.model.parameters():
             p.requires_grad = False
-        log.info("Frozen: 4M encoder")
+        log.info("Frozen: 4M backbone (depth/seg embedders remain trainable)")
 
     if args.freeze_mlp:
         for p in vlm_with_expert.fourm_to_vlm.parameters():
@@ -196,7 +211,11 @@ def apply_lora(pipeline, args):
              f"trainable LoRA params: {lora_params:,}")
 
 
-def make_batch(sample, args, tokenizer, device, has_precomputed_modalities=False):
+def make_batch(sample, args, tokenizer, device, has_precomputed_modalities=False, cli_args=None):
+    no_block1 = getattr(cli_args, "no_block1", False) if cli_args is not None else False
+    use_depth = getattr(cli_args, "use_depth", False) if cli_args is not None else False
+    use_seg   = getattr(cli_args, "use_seg",   False) if cli_args is not None else False
+
     rgb     = sample["rgb" if has_precomputed_modalities else args.image_key].to(device)
     state   = sample["observation.state"].to(device)
     actions = sample["action"].to(device)
@@ -213,16 +232,24 @@ def make_batch(sample, args, tokenizer, device, has_precomputed_modalities=False
         return_tensors="pt",
     )
 
-    if has_precomputed_modalities:
-        # All 4 modalities available from pre-generated parquet dataset
+    if no_block1:
+        # Block1 skipped: pass only the modalities the 4M encoder needs
+        inputs = {"rgb": rgb}
+        if has_precomputed_modalities:
+            if use_depth:
+                inputs["depth"] = sample["depth"].to(device)
+            if use_seg:
+                inputs["seg"] = sample["seg"].to(device)
+    elif has_precomputed_modalities:
+        # Block1 active: thermal drives ImageBind; depth/seg available as residuals
         inputs = {
             "rgb":     rgb,
-            "depth":   sample["depth"].to(device),    # (B, 1, 224, 224)
-            "seg":     sample["seg"].to(device),      # (B, 1, 224, 224)
-            "thermal": sample["thermal"].to(device),  # (B, 3, 224, 224) — skips ThermalGen in Block1
+            "depth":   sample["depth"].to(device),
+            "seg":     sample["seg"].to(device),
+            "thermal": sample["thermal"].to(device),
         }
     else:
-        # HuggingFace dataset: only RGB available, Block1 generates thermal on-the-fly
+        # HuggingFace dataset: only RGB, Block1 generates thermal on-the-fly
         inputs = {
             "rgb":   rgb,
             "depth": torch.zeros_like(rgb[:, :1]),
@@ -295,6 +322,9 @@ def main():
         modalities=args.modalities,
         corruption_types=args.corruption_types,
         device=device,
+        skip_block1=args.no_block1,
+        use_depth=args.use_depth,
+        use_seg=args.use_seg,
     )
     if args.resume_checkpoint:
         log.info(f"Resuming from checkpoint: {args.resume_checkpoint}")
@@ -314,7 +344,12 @@ def main():
     vlm_with_expert = pipeline.block2.smolvla.policy.base_policy.model.vlm_with_expert
     base_model      = pipeline.block2.smolvla.policy.base_policy.model
 
+    # MLP group: connector + depth/seg patch embedders (all at high lr for fast alignment)
     mlp_param_ids = {id(p) for p in vlm_with_expert.fourm_to_vlm.parameters()}
+    if hasattr(vlm_with_expert.fourm_encoder, "depth_embed"):
+        mlp_param_ids.update(id(p) for p in vlm_with_expert.fourm_encoder.depth_embed.parameters())
+    if hasattr(vlm_with_expert.fourm_encoder, "seg_embed"):
+        mlp_param_ids.update(id(p) for p in vlm_with_expert.fourm_encoder.seg_embed.parameters())
 
     action_head_param_ids = set()
     for component_name in ["action_in_proj", "action_out_proj",
@@ -360,15 +395,21 @@ def main():
             if step >= args.steps:
                 break
 
-            inputs, batch = make_batch(sample, args, tokenizer, device, has_precomputed_modalities)
+            inputs, batch = make_batch(sample, args, tokenizer, device,
+                                       has_precomputed_modalities, args)
 
-            if args.distill:
-                loss_dict = pipeline.compute_distill_loss(inputs, epoch=step)
-            elif args.joint:
-                loss_dict = pipeline.compute_joint_loss(
-                    inputs, batch, epoch=step, lambda_distill=args.lambda_distill)
-            else:
-                loss_dict = pipeline.compute_loss(inputs, batch, epoch=step)
+            autocast_ctx = (torch.amp.autocast("cuda", dtype=torch.bfloat16)
+                            if args.bf16 and device == "cuda"
+                            else contextlib.nullcontext())
+
+            with autocast_ctx:
+                if args.distill:
+                    loss_dict = pipeline.compute_distill_loss(inputs, epoch=step)
+                elif args.joint:
+                    loss_dict = pipeline.compute_joint_loss(
+                        inputs, batch, epoch=step, lambda_distill=args.lambda_distill)
+                else:
+                    loss_dict = pipeline.compute_loss(inputs, batch, epoch=step)
             loss = loss_dict["loss"]
 
             optimizer.zero_grad()
@@ -387,9 +428,9 @@ def main():
 
                 if args.distill:
                     log.info(f"step={step}/{args.steps}  distill_loss={avg:.4f}"
-                             f"  norm_ratio={avg_extras.get('norm_ratio', 0):.2f}"
-                             f"  siglip_norm={avg_extras.get('siglip_norm', 0):.1f}"
-                             f"  mlp_norm={avg_extras.get('mlp_norm', 0):.1f}")
+                             f"  cos_sim={avg_extras.get('mean_cosine_similarity', 0):.4f}"
+                             f"  mlp_norm={avg_extras.get('mlp_norm', 0):.1f}"
+                             f"  siglip_norm={avg_extras.get('siglip_norm', 0):.1f}")
                 elif args.joint:
                     log.info(f"step={step}/{args.steps}  total_loss={avg:.4f}"
                              f"  action={avg_extras.get('action_loss', 0):.4f}"

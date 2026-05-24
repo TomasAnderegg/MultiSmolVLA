@@ -1,9 +1,10 @@
 import sys
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-sys.path.append("third_party/ThermalGen")
+sys.path.append(os.path.join(os.path.dirname(__file__), "..", "..", "third_party", "ThermalGen"))
 from thermalgen_demo import ThermalGenSIT
 
 

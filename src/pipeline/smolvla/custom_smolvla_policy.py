@@ -34,6 +34,8 @@ class CustomSmolVLAPolicy(nn.Module):
         fourm_checkpoint: Optional[str] = None,
         fourm_dim: Optional[int] = None,
         device: str = "cuda",
+        use_depth: Optional[bool] = None,
+        use_seg: Optional[bool] = None,
     ):
         super().__init__()
         if pretrained is None and config is None:
@@ -61,6 +63,9 @@ class CustomSmolVLAPolicy(nn.Module):
         fourm_checkpoint = "EPFL-VILAB/4M-21_XL" if fourm_checkpoint is None else fourm_checkpoint
         fourm_dim = 1024 if fourm_dim is None else fourm_dim
 
+        self._use_depth = use_depth if use_depth is not None else False
+        self._use_seg   = use_seg   if use_seg   is not None else False
+
         if use_4m:
             self._patch_visual_backbone(
                 use_4m=use_4m,
@@ -69,6 +74,8 @@ class CustomSmolVLAPolicy(nn.Module):
                 fourm_checkpoint=fourm_checkpoint,
                 fourm_dim=fourm_dim,
                 device=device,
+                use_depth=self._use_depth,
+                use_seg=self._use_seg,
             )
 
         self._queues = {ACTION: deque(maxlen=self.config.n_action_steps)}
@@ -81,6 +88,8 @@ class CustomSmolVLAPolicy(nn.Module):
         fourm_checkpoint: str,
         fourm_dim: int,
         device: str,
+        use_depth: bool = False,
+        use_seg: bool = False,
     ) -> None:
         # Patch the already-loaded vlm_with_expert in-place so we don't load SmolVLM2 a second time
         # and so we keep the pretrained lerobot/smolvla_libero weights.
@@ -90,9 +99,11 @@ class CustomSmolVLAPolicy(nn.Module):
         # n'existe pas de base dans SmolVLMWithExpertModel (python l'accepte)
 
         # Attach 4M encoder — nn.Module.__setattr__ registers it as a proper submodule
-        vlm.fourm_encoder = Encoder4M(checkpoint=fourm_checkpoint, device=device)
+        vlm.fourm_encoder = Encoder4M(checkpoint=fourm_checkpoint, device=device,
+                                       use_depth=use_depth, use_seg=use_seg)
         if freeze_4m:
-            for p in vlm.fourm_encoder.parameters():
+            # Freeze only the pretrained 4M backbone; keep depth/seg embedders trainable
+            for p in vlm.fourm_encoder.model.parameters():
                 p.requires_grad = False
 
         # MLP connector: use the actual output dim from the loaded encoder (768 for B, 1024 for L/XL)
