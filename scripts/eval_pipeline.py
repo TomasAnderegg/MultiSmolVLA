@@ -360,6 +360,16 @@ def parse_args():
     p.add_argument("--device", type=str, default=None,
                    help="cuda or cpu (auto-detected if omitted).")
 
+    p.add_argument("--record_video", action="store_true",
+                   help="Save an MP4 video of the first episode of each evaluated task.")
+    p.add_argument("--video_fps", type=int, default=10,
+                   help="Frames per second for the output video (default 10).")
+    p.add_argument("--no_block1", action="store_true",
+                   help="Skip Block1 (ThermalGen+ImageBind) — required for stage1_rgb checkpoints.")
+    p.add_argument("--use_depth", action="store_true",
+                   help="Pass depth channel into 4M (required for stage1_rgb_ds checkpoints).")
+    p.add_argument("--use_seg", action="store_true",
+                   help="Pass seg channel into 4M (required for stage1_rgb_ds checkpoints).")
     p.add_argument("--no_thermal", action="store_true",
                    help="Ablation: zero out the thermal embedding (skip ThermalGen+ImageBind).")
 
@@ -416,6 +426,9 @@ def build_pipeline(args, device: str):
         freeze_4m=True,
         freeze_mlp=False,
         device=device,
+        skip_block1=getattr(args, "no_block1", False),
+        use_depth=getattr(args, "use_depth", False),
+        use_seg=getattr(args, "use_seg", False),
     )
 
     if args.checkpoint is not None:
@@ -505,6 +518,37 @@ def obs_to_pipeline_inputs(
 # Episode / eval loop
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _save_video(frames: list, path: str, fps: int) -> None:
+    try:
+        import imageio
+        imageio.mimwrite(path, frames, fps=fps, codec="libx264", quality=8)
+        print(f"[video] saved → {path}", flush=True)
+    except Exception as e:
+        print(f"[video] imageio failed ({e}), trying cv2 ...", flush=True)
+        try:
+            import cv2
+            H, W, _ = frames[0].shape
+            writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
+            for f in frames:
+                writer.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
+            writer.release()
+            print(f"[video] saved → {path}", flush=True)
+        except Exception as e2:
+            print(f"[video] failed: {e2}", flush=True)
+
+
+def _extract_rgb_frame(obs_raw: dict) -> np.ndarray | None:
+    """Extract the first RGB image found in obs_raw as uint8 (H, W, 3)."""
+    for key in obs_raw:
+        v = obs_raw[key]
+        if isinstance(v, np.ndarray) and v.ndim >= 3 and v.shape[-1] == 3:
+            arr = v[0] if v.ndim == 4 else v  # unbatch if needed
+            if arr.dtype != np.uint8:
+                arr = (np.clip(arr, 0, 1) * 255).astype(np.uint8) if arr.max() <= 1.0 else arr.astype(np.uint8)
+            return arr
+    return None
+
+
 def run_episode(
     vec_env,
     pipeline: VLAPipeline,
@@ -514,12 +558,18 @@ def run_episode(
     device: str,
     args,
     corruptor: ModalityDropout | None = None,
+    save_video_path: str | None = None,
 ) -> list[bool]:
     """Run one batched episode; return per-env success flags."""
     inject_depth_seg_envs(vec_env)
 
     reset_pipeline(pipeline)
     obs_raw, _ = vec_env.reset()
+    frames: list[np.ndarray] = []
+    if save_video_path:
+        f = _extract_rgb_frame(obs_raw)
+        if f is not None:
+            frames.append(f)
 
     obs = preprocess_observation(obs_raw)
     obs = env_preprocessor(obs)
@@ -576,6 +626,11 @@ def run_episode(
 
         obs_raw, _reward, terminated, truncated, info = vec_env.step(a_np[None])
 
+        if save_video_path:
+            f = _extract_rgb_frame(obs_raw)
+            if f is not None:
+                frames.append(f)
+
         obs = preprocess_observation(obs_raw)
         obs = env_preprocessor(obs)
 
@@ -597,17 +652,26 @@ def run_episode(
     gripper_summary = (f"min={g_arr.min():.2f} max={g_arr.max():.2f} "
                        f"open_frac={float((g_arr > 0).mean()):.0%}")
     print(f"[episode] steps={step_i+1} success={success.tolist()} gripper({gripper_summary})", flush=True)
+
+    if save_video_path and frames:
+        _save_video(frames, save_video_path, fps=getattr(args, "video_fps", 10))
+
     return success.tolist()
 
 
 def eval_task(task_id, vec_env, pipeline, env_preprocessor, preprocessor, postprocessor,
-              device, args, corruptor: ModalityDropout | None = None) -> dict:
+              device, args, corruptor: ModalityDropout | None = None,
+              video_dir: str | None = None) -> dict:
     """Evaluate one task for n_episodes; return success list and rate."""
     successes: list[bool] = []
     ep_idx = 0
     while len(successes) < args.n_episodes:
+        video_path = None
+        if video_dir and ep_idx == 0:
+            os.makedirs(video_dir, exist_ok=True)
+            video_path = os.path.join(video_dir, f"task{task_id}_ep0.mp4")
         ep = run_episode(vec_env, pipeline, env_preprocessor, preprocessor, postprocessor,
-                         device, args, corruptor)
+                         device, args, corruptor, save_video_path=video_path)
         successes.extend(ep)
         ep_idx += 1
     successes = successes[: args.n_episodes]
@@ -659,8 +723,9 @@ def main():
         log.info(f"\n── Suite: {suite_name}  ({len(task_envs)} tasks) ──────────────────────────")
         suite_results: dict = {}
         for task_id, vec_env in task_envs.items():
+            video_dir = os.path.join(args.output_dir, "videos") if getattr(args, "record_video", False) else None
             result = eval_task(task_id, vec_env, pipeline, env_preprocessor, preprocessor, postprocessor,
-                               device, args, corruptor)
+                               device, args, corruptor, video_dir=video_dir)
             suite_results[task_id] = result
             all_successes.extend(result["successes"])
             vec_env.close()

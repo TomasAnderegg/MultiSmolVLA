@@ -37,7 +37,7 @@ python -u scripts/train_full_pipeline.py \
     --steps 20000 \
     --save_every 2000 \
     --log_every 50 \
-    --num_workers 4 \
+    --num_workers 2 \
     --output_dir /scratch/checkpoints/stage1_rgb \
     --wandb \
     --wandb_project multismolvla \

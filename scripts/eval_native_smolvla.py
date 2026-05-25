@@ -36,10 +36,45 @@ def _extract_success(info, n_envs):
     return np.zeros(n_envs, dtype=bool)
 
 
+def _save_video(frames: list, path: str, fps: int) -> None:
+    try:
+        import imageio
+        imageio.mimwrite(path, frames, fps=fps, codec="libx264", quality=8)
+        print(f"[video] saved → {path}", flush=True)
+    except Exception as e:
+        print(f"[video] imageio failed ({e}), trying cv2 ...", flush=True)
+        try:
+            import cv2
+            H, W, _ = frames[0].shape
+            writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
+            for f in frames:
+                writer.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
+            writer.release()
+            print(f"[video] saved → {path}", flush=True)
+        except Exception as e2:
+            print(f"[video] failed: {e2}", flush=True)
+
+
+def _extract_rgb_frame(obs_raw: dict) -> np.ndarray | None:
+    for key in obs_raw:
+        v = obs_raw[key]
+        if isinstance(v, np.ndarray) and v.ndim >= 3 and v.shape[-1] == 3:
+            arr = v[0] if v.ndim == 4 else v
+            if arr.dtype != np.uint8:
+                arr = (np.clip(arr, 0, 1) * 255).astype(np.uint8) if arr.max() <= 1.0 else arr.astype(np.uint8)
+            return arr
+    return None
+
+
 def run_episode(vec_env, policy, env_preprocessor, preprocessor, postprocessor,
-                device, debug=False) -> list[bool]:
+                device, debug=False, save_video_path: str | None = None) -> list[bool]:
     policy.reset()
     obs_raw, _ = vec_env.reset()
+    frames: list[np.ndarray] = []
+    if save_video_path:
+        f = _extract_rgb_frame(obs_raw)
+        if f is not None:
+            frames.append(f)
     obs = preprocess_observation(obs_raw)
     obs = env_preprocessor(obs)
 
@@ -92,6 +127,10 @@ def run_episode(vec_env, policy, env_preprocessor, preprocessor, postprocessor,
 
         action_np = action.cpu().numpy()
         obs_raw, _reward, terminated, truncated, info = vec_env.step(action_np)
+        if save_video_path:
+            f = _extract_rgb_frame(obs_raw)
+            if f is not None:
+                frames.append(f)
         obs = preprocess_observation(obs_raw)
         obs = env_preprocessor(obs)
         obs["task"] = task_descs
@@ -107,6 +146,9 @@ def run_episode(vec_env, policy, env_preprocessor, preprocessor, postprocessor,
     if debug:
         print(f"  [dbg] episode done step={step_i} success={success.tolist()}", flush=True)
 
+    if save_video_path and frames:
+        _save_video(frames, save_video_path, fps=10)
+
     return success.tolist()
 
 
@@ -114,10 +156,14 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--task",        default="libero_10")
+    parser.add_argument("--task_ids",    type=int, nargs="+", default=None,
+                        help="Task indices to evaluate (default: all).")
     parser.add_argument("--n_episodes",  type=int, default=5)
     parser.add_argument("--batch_size",  type=int, default=1)
     parser.add_argument("--output_dir",  default="eval_results/smolvla_native_libero_10")
     parser.add_argument("--model_id",    default="lerobot/smolvla_libero")
+    parser.add_argument("--record_video", action="store_true",
+                        help="Save MP4 video of the first episode of each task.")
     args = parser.parse_args()
 
     try:
@@ -145,7 +191,7 @@ def _main(args):
     )
     print(f"[eval] preprocessor={type(preprocessor).__name__}  postprocessor={type(postprocessor).__name__}", flush=True)
 
-    env_cfg = LiberoEnvCfg(task=args.task, obs_type="pixels_agent_pos")
+    env_cfg = LiberoEnvCfg(task=args.task, task_ids=args.task_ids, obs_type="pixels_agent_pos")
     print("[eval] Calling make_env ...", flush=True)
     envs = make_env(env_cfg, n_envs=args.batch_size)
     env_preprocessor, _ = env_cfg.get_env_processors()
@@ -154,15 +200,23 @@ def _main(args):
     all_results = {}
     all_successes = []
 
+    video_base = os.path.join(args.output_dir, "videos") if args.record_video else None
+
     for suite_name, task_envs in envs.items():
         print(f"\n── Suite: {suite_name} ({len(task_envs)} tasks) ──", flush=True)
         for task_id, vec_env in task_envs.items():
             successes = []
+            ep_idx = 0
             while len(successes) < args.n_episodes:
-                debug = (task_id == 0 and len(successes) == 0)
+                debug = (task_id == 0 and ep_idx == 0)
+                video_path = None
+                if video_base and ep_idx == 0:
+                    os.makedirs(video_base, exist_ok=True)
+                    video_path = os.path.join(video_base, f"task{task_id}_ep0.mp4")
                 ep = run_episode(vec_env, policy, env_preprocessor, preprocessor,
-                                 postprocessor, device, debug=debug)
+                                 postprocessor, device, debug=debug, save_video_path=video_path)
                 successes.extend(ep)
+                ep_idx += 1
             successes = successes[:args.n_episodes]
             sr = float(np.mean(successes)) * 100
             print(f"  task_id={task_id} → {sr:.1f}% ({args.n_episodes} episodes)", flush=True)
