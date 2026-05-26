@@ -28,6 +28,7 @@ class VLAPipeline(nn.Module):
         skip_block1: bool = False,
         use_depth: bool = False,
         use_seg: bool = False,
+        from_scratch: bool = False,
     ):
         super().__init__()
         self.device = device
@@ -51,6 +52,7 @@ class VLAPipeline(nn.Module):
             device=device,
             use_depth=use_depth,
             use_seg=use_seg,
+            from_scratch=from_scratch,
         )
 
     def _run_block1(self, inputs: dict, epoch: int) -> dict:

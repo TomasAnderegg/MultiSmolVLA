@@ -52,11 +52,25 @@ class ParquetThermalDataset(Dataset):
     Each shard is loaded on demand with a LRU-1 per-worker cache to limit I/O.
     """
 
-    def __init__(self, data_dir: str, chunk_size: int = 50):
+    def __init__(self, data_dir: str, chunk_size: int = 50, task_ids: list[int] | None = None):
         self.chunk_size = chunk_size
-        self.shards = sorted(glob.glob(os.path.join(data_dir, "*.parquet")))
-        if not self.shards:
+        all_shards = sorted(glob.glob(os.path.join(data_dir, "*.parquet")))
+        if not all_shards:
             raise ValueError(f"No parquet files found in {data_dir}")
+
+        # Filter shards by task_id if requested
+        if task_ids is not None:
+            task_id_set = set(task_ids)
+            filtered = []
+            for shard in all_shards:
+                tid = pd.read_parquet(shard, columns=["task_index"])["task_index"].iloc[0]
+                if int(tid) in task_id_set:
+                    filtered.append(shard)
+            self.shards = filtered
+            if not self.shards:
+                raise ValueError(f"No shards found for task_ids={task_ids} in {data_dir}")
+        else:
+            self.shards = all_shards
 
         # Build (shard_idx, row_idx) index and record each shard's length
         self._index = []

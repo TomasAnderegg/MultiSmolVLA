@@ -92,6 +92,12 @@ def parse_args():
                         help="Path to a full VLAPipeline .pt checkpoint to resume from. "
                              "Loaded after pipeline construction, before training.")
 
+    # Train action head from scratch (random init) with pretrained SmolVLM2 backbone.
+    # Mirrors baseline lerobot approach: load_vlm_weights=True, no pretrained action head.
+    parser.add_argument("--from_scratch", action="store_true",
+                        help="Ignore --smolvla_checkpoint and initialise the action head randomly. "
+                             "The SmolVLM2 VLM backbone is still loaded from HuggingFace (load_vlm_weights=True).")
+
     # Distillation loss (Stage 1 alignment)
     parser.add_argument("--distill", action="store_true",
                         help="Use feature distillation loss (cosine SigLIP vs 4M+MLP) "
@@ -113,6 +119,9 @@ def parse_args():
     parser.add_argument("--log_every", type=int, default=50)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--max_lang_tokens", type=int, default=48)
+    parser.add_argument("--task_ids", type=int, nargs="+", default=None,
+                        help="Filter training data to these task indices (e.g. --task_ids 2). "
+                             "Default: all tasks.")
     parser.add_argument("--chunk_size", type=int, default=50,
                         help="Number of future action steps per training sample (must match SmolVLA chunk_size)")
 
@@ -288,7 +297,7 @@ def main():
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
         from utils.parquet_dataset import ParquetThermalDataset
         log.info(f"Loading pre-generated parquet dataset from: {args.data_dir}")
-        dataset = ParquetThermalDataset(args.data_dir, chunk_size=args.chunk_size)
+        dataset = ParquetThermalDataset(args.data_dir, chunk_size=args.chunk_size, task_ids=args.task_ids)
         has_precomputed_modalities = True
     else:
         from lerobot.datasets import LeRobotDataset
@@ -325,6 +334,7 @@ def main():
         skip_block1=args.no_block1,
         use_depth=args.use_depth,
         use_seg=args.use_seg,
+        from_scratch=args.from_scratch,
     )
     if args.resume_checkpoint:
         log.info(f"Resuming from checkpoint: {args.resume_checkpoint}")
@@ -337,6 +347,16 @@ def main():
 
     # Apply freeze flags first so optimizer only tracks trainable params
     apply_freeze_flags(pipeline, args)
+
+    # Cast frozen params to bf16 to free ~14 GB on the V100 (7B frozen params * 2 bytes saved).
+    # Safe because frozen params never receive gradient updates.
+    if args.bf16:
+        n_cast = sum(1 for p in pipeline.parameters() if not p.requires_grad)
+        for p in pipeline.parameters():
+            if not p.requires_grad:
+                p.data = p.data.to(torch.bfloat16)
+        log.info(f"Cast {n_cast} frozen param tensors to bf16 "
+                 f"(freed ~{sum(p.numel() for p in pipeline.parameters() if not p.requires_grad) * 2 / 2**30:.1f} GB)")
 
     if args.lora:
         apply_lora(pipeline, args)

@@ -35,6 +35,7 @@ import json
 import logging
 import os
 import sys
+import threading
 
 import numpy as np
 import torch
@@ -47,6 +48,8 @@ sys.path.insert(0, _REPO)
 sys.path.insert(0, os.path.join(_REPO, "third_party", "lerobot", "src"))
 
 from lerobot.envs import make_env, preprocess_observation
+from lerobot.utils.io_utils import write_video
+from lerobot.processor import hotswap_stats
 from lerobot.envs.configs import LiberoEnv as LiberoEnvCfg  # the dataclass config
 from lerobot.policies import make_pre_post_processors
 
@@ -355,6 +358,10 @@ def parse_args():
                    help="Number of episodes per task to evaluate.")
     p.add_argument("--max_lang_tokens", type=int, default=48)
     p.add_argument("--output_dir", type=str, default="./eval_logs/multismolvla")
+    p.add_argument("--max_episodes_rendered", type=int, default=10,
+                   help="Max number of episodes to save as video (0 to disable).")
+    p.add_argument("--videos_dir", type=str, default=None,
+                   help="Directory to save videos. Defaults to <output_dir>/videos.")
 
     # Device
     p.add_argument("--device", type=str, default=None,
@@ -440,6 +447,22 @@ def build_pipeline(args, device: str):
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg, pretrained_path=args.smolvla_checkpoint
     )
+
+    # Fix: override postprocessor stats with our fine-tuning dataset's stats.
+    # lerobot/smolvla_libero ships its own normalization stats; our model was
+    # fine-tuned on TomasAnderegg/libero_10_thermal which has different action
+    # statistics (computed from the parquet files directly).
+    _DATASET_ACTION_STATS = {
+        "action": {
+            "mean": [ 0.018657,  0.056660, -0.056311,  0.004768,  0.002410, -0.008250, -0.106539],
+            "std":  [ 0.279576,  0.353348,  0.358189,  0.039455,  0.055075,  0.089437,  0.994155],
+            "min":  [-0.937500, -0.937500, -0.937500, -0.236429, -0.305357, -0.367500, -1.000000],
+            "max":  [ 0.937500,  0.937500,  0.937500,  0.328929,  0.369643,  0.375000,  1.000000],
+        }
+    }
+    postprocessor = hotswap_stats(postprocessor, _DATASET_ACTION_STATS)
+    log.info("Postprocessor stats overridden with TomasAnderegg/libero_10_thermal stats ✅")
+
     log.info("Processors loaded ✅")
 
     return pipeline, preprocessor, postprocessor
@@ -505,6 +528,15 @@ def obs_to_pipeline_inputs(
 # Episode / eval loop
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _collect_frame(vec_env, ep_frames: list | None):
+    if ep_frames is None:
+        return
+    if isinstance(vec_env, __import__("gymnasium").vector.SyncVectorEnv):
+        ep_frames.append(np.stack([vec_env.envs[0].render()]))
+    elif hasattr(vec_env, "call"):
+        ep_frames.append(np.stack(vec_env.call("render")[:1]))
+
+
 def run_episode(
     vec_env,
     pipeline: VLAPipeline,
@@ -514,12 +546,14 @@ def run_episode(
     device: str,
     args,
     corruptor: ModalityDropout | None = None,
+    ep_frames: list | None = None,
 ) -> list[bool]:
     """Run one batched episode; return per-env success flags."""
     inject_depth_seg_envs(vec_env)
 
     reset_pipeline(pipeline)
     obs_raw, _ = vec_env.reset()
+    _collect_frame(vec_env, ep_frames)
 
     obs = preprocess_observation(obs_raw)
     obs = env_preprocessor(obs)
@@ -575,6 +609,7 @@ def run_episode(
                 _debug_printed = True
 
         obs_raw, _reward, terminated, truncated, info = vec_env.step(a_np[None])
+        _collect_frame(vec_env, ep_frames)
 
         obs = preprocess_observation(obs_raw)
         obs = env_preprocessor(obs)
@@ -601,19 +636,49 @@ def run_episode(
 
 
 def eval_task(task_id, vec_env, pipeline, env_preprocessor, preprocessor, postprocessor,
-              device, args, corruptor: ModalityDropout | None = None) -> dict:
+              device, args, corruptor: ModalityDropout | None = None,
+              videos_dir: str | None = None, n_rendered: list | None = None) -> dict:
     """Evaluate one task for n_episodes; return success list and rate."""
     successes: list[bool] = []
+    video_paths: list[str] = []
+    threads: list[threading.Thread] = []
     ep_idx = 0
+    n_rendered = n_rendered if n_rendered is not None else [0]
+
     while len(successes) < args.n_episodes:
+        record = (videos_dir is not None and n_rendered[0] < args.max_episodes_rendered)
+        ep_frames: list | None = [] if record else None
+
         ep = run_episode(vec_env, pipeline, env_preprocessor, preprocessor, postprocessor,
-                         device, args, corruptor)
+                         device, args, corruptor, ep_frames=ep_frames)
         successes.extend(ep)
+
+        if record and ep_frames:
+            stacked = np.stack(ep_frames, axis=1)  # (1, T, H, W, C)
+            os.makedirs(videos_dir, exist_ok=True)
+            video_path = os.path.join(videos_dir, f"task{task_id}_ep{n_rendered[0]}.mp4")
+            video_paths.append(video_path)
+            fps = 10  # LIBERO default render fps
+            try:
+                fps = vec_env.unwrapped.metadata.get("render_fps", 10)
+            except Exception:
+                pass
+            t = threading.Thread(target=write_video, args=(video_path, stacked[0], fps))
+            t.start()
+            threads.append(t)
+            n_rendered[0] += 1
+
         ep_idx += 1
+
+    for t in threads:
+        t.join()
+
     successes = successes[: args.n_episodes]
     sr = float(np.mean(successes)) * 100
     print(f"[task {task_id}] → {sr:.1f}%  ({args.n_episodes} episodes)  successes={successes}", flush=True)
-    return {"success_rate": sr, "successes": successes}
+    if video_paths:
+        print(f"[task {task_id}] videos saved: {video_paths}", flush=True)
+    return {"success_rate": sr, "successes": successes, "video_paths": video_paths}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -629,6 +694,8 @@ def main():
     log.info(f"Device: {device}")
 
     os.makedirs(args.output_dir, exist_ok=True)
+    videos_dir = args.videos_dir or os.path.join(args.output_dir, "videos")
+    n_rendered = [0]  # shared counter across tasks
 
     # Build pipeline + processors
     pipeline, preprocessor, postprocessor = build_pipeline(args, device)
@@ -660,7 +727,9 @@ def main():
         suite_results: dict = {}
         for task_id, vec_env in task_envs.items():
             result = eval_task(task_id, vec_env, pipeline, env_preprocessor, preprocessor, postprocessor,
-                               device, args, corruptor)
+                               device, args, corruptor,
+                               videos_dir=videos_dir if args.max_episodes_rendered > 0 else None,
+                               n_rendered=n_rendered)
             suite_results[task_id] = result
             all_successes.extend(result["successes"])
             vec_env.close()
@@ -669,9 +738,11 @@ def main():
     overall_sr = float(np.mean(all_successes)) * 100 if all_successes else 0.0
     log.info(f"\nOverall success rate: {overall_sr:.1f}%  ({len(all_successes)} total episodes)")
 
+    all_video_paths = [p for s in all_results.values() for r in s.values() for p in r.get("video_paths", [])]
     output = {
         "overall_success_rate": overall_sr,
         "per_suite": all_results,
+        "video_paths": all_video_paths,
         "corruption": {
             "modalities": args.corrupt_modalities,
             "alpha": args.corrupt_alpha,

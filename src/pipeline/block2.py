@@ -30,6 +30,7 @@ class Block2(nn.Module):
         device: str = "cuda",
         use_depth: bool = False,
         use_seg: bool = False,
+        from_scratch: bool = False,
     ):
         super().__init__()
         self.device = device
@@ -43,6 +44,7 @@ class Block2(nn.Module):
             device=device,
             use_depth=use_depth,
             use_seg=use_seg,
+            from_scratch=from_scratch,
         )
 
     def forward(self, inputs: dict, batch: dict) -> torch.Tensor:

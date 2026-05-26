@@ -18,21 +18,40 @@ class SmolVLAWrapper(nn.Module):
         device: str = "cuda",
         use_depth: bool = False,
         use_seg: bool = False,
+        from_scratch: bool = False,
     ):
         super().__init__()
         self.device = device
-        print(f"[CustomSmolVLA] Loading policy from {pretrained} with 4M={use_4m} ...")
-        self.policy = CustomSmolVLAPolicy(
-            pretrained=pretrained,
-            use_4m=use_4m,
-            freeze_4m=freeze_4m,
-            freeze_mlp=freeze_mlp,
-            fourm_checkpoint=fourm_checkpoint,
-            fourm_dim=fourm_dim,
-            device=device,
-            use_depth=use_depth,
-            use_seg=use_seg,
-        )
+
+        if from_scratch:
+            # Random action head, pretrained SmolVLM2 VLM backbone — mirrors baseline lerobot approach
+            from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+            config = SmolVLAConfig(load_vlm_weights=True)
+            print("[CustomSmolVLA] Initialising from scratch (random action head, pretrained VLM backbone) ...")
+            self.policy = CustomSmolVLAPolicy(
+                config=config,
+                use_4m=use_4m,
+                freeze_4m=freeze_4m,
+                freeze_mlp=freeze_mlp,
+                fourm_checkpoint=fourm_checkpoint,
+                fourm_dim=fourm_dim,
+                device=device,
+                use_depth=use_depth,
+                use_seg=use_seg,
+            )
+        else:
+            print(f"[CustomSmolVLA] Loading policy from {pretrained} with 4M={use_4m} ...")
+            self.policy = CustomSmolVLAPolicy(
+                pretrained=pretrained,
+                use_4m=use_4m,
+                freeze_4m=freeze_4m,
+                freeze_mlp=freeze_mlp,
+                fourm_checkpoint=fourm_checkpoint,
+                fourm_dim=fourm_dim,
+                device=device,
+                use_depth=use_depth,
+                use_seg=use_seg,
+            )
         self.policy.to(device)
         self.policy.eval()
         print("[CustomSmolVLA] Loaded ✅")
