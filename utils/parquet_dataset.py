@@ -11,18 +11,19 @@ from torch.utils.data import Dataset
 IMAGE_SIZE = 224
 
 # LIBERO-10 task index → language instruction
-# task_index maps to the 10 manipulation tasks in binhng/libero_10_lerobot_mask_depth
+# Source: libero/libero/benchmark/libero_suite_task_map.py, "libero_10" entry.
+# Language = filename after stripping scene prefix (e.g. KITCHEN_SCENE3_), underscores→spaces.
 LIBERO10_TASKS = {
-    0: "pick up the alphabet soup and place it in the basket",
-    1: "pick up the cream cheese box and place it in the basket",
-    2: "pick up the salad dressing and place it in the basket",
-    3: "pick up the bbq sauce and place it in the basket",
-    4: "pick up the ketchup and place it in the basket",
-    5: "pick up the milk and place it in the basket",
-    6: "pick up the tomato sauce and place it in the basket",
-    7: "pick up the butter and place it in the basket",
-    8: "pick up the chocolate pudding and place it in the basket",
-    9: "pick up the cream cheese and place it in the basket",
+    0: "put both the alphabet soup and the tomato sauce in the basket",
+    1: "put both the cream cheese box and the butter in the basket",
+    2: "turn on the stove and put the moka pot on it",
+    3: "put the black bowl in the bottom drawer of the cabinet and close it",
+    4: "put the white mug on the left plate and put the yellow and white mug on the right plate",
+    5: "pick up the book and place it in the back compartment of the caddy",
+    6: "put the white mug on the plate and put the chocolate pudding to the right of the plate",
+    7: "put both the alphabet soup and the cream cheese box in the basket",
+    8: "put both moka pots on the stove",
+    9: "put the yellow and white mug in the microwave and close it",
 }
 
 

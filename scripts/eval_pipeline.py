@@ -370,6 +370,11 @@ def parse_args():
                    help="Pass depth channel into 4M (required for stage1_rgb_ds checkpoints).")
     p.add_argument("--use_seg", action="store_true",
                    help="Pass seg channel into 4M (required for stage1_rgb_ds checkpoints).")
+    p.add_argument("--lora", action="store_true",
+                   help="Apply LoRA adapters to SmolVLM before loading checkpoint (required for LoRA checkpoints).")
+    p.add_argument("--lora_r",       type=int,   default=16)
+    p.add_argument("--lora_alpha",   type=int,   default=32)
+    p.add_argument("--lora_dropout", type=float, default=0.05)
     p.add_argument("--no_thermal", action="store_true",
                    help="Ablation: zero out the thermal embedding (skip ThermalGen+ImageBind).")
 
@@ -416,6 +421,22 @@ def apply_eval_corruption(inputs: dict, corruptor: ModalityDropout, alpha: float
 # Pipeline helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _apply_lora_for_eval(pipeline, args):
+    """Apply LoRA adapters to SmolVLM backbone before loading a LoRA checkpoint."""
+    from peft import LoraConfig, get_peft_model
+    vlm_with_expert = pipeline.block2.smolvla.policy.base_policy.model.vlm_with_expert
+    vlm_model = vlm_with_expert.get_vlm_model()
+    lora_config = LoraConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        lora_dropout=args.lora_dropout,
+        bias="none",
+    )
+    get_peft_model(vlm_model, lora_config)
+    log.info(f"LoRA adapters applied for eval (r={args.lora_r}, alpha={args.lora_alpha})")
+
+
 def build_pipeline(args, device: str):
     log.info("Building VLAPipeline ...")
     pipeline = VLAPipeline(
@@ -434,7 +455,14 @@ def build_pipeline(args, device: str):
     if args.checkpoint is not None:
         log.info(f"Loading checkpoint: {args.checkpoint}")
         state = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-        state.pop("_siglip_proj.weight", None)  # training-only key, not part of inference pipeline
+        state.pop("_siglip_proj.weight", None)
+
+        # Auto-detect LoRA checkpoint or use explicit --lora flag
+        has_lora_keys = any("lora_" in k for k in state.keys())
+        if has_lora_keys or getattr(args, "lora", False):
+            log.info("LoRA keys detected in checkpoint — applying LoRA adapters before load")
+            _apply_lora_for_eval(pipeline, args)
+
         missing, unexpected = pipeline.load_state_dict(state, strict=False)
         if missing:
             log.info(f"Checkpoint partial load — {len(missing)} frozen keys not in checkpoint (expected for LoRA/MLP-only checkpoints)")

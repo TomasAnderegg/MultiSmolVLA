@@ -41,11 +41,14 @@ log = logging.getLogger(__name__)
 def parse_args():
     parser = argparse.ArgumentParser(description="Train Block 2 on LIBERO")
 
-    # Dataset
-    parser.add_argument("--dataset", type=str, default="lerobot/libero_spatial_no_noops",
-                        help="HuggingFace dataset repo id")
+    # Dataset — use either HF dataset OR local parquet (mutually exclusive)
+    parser.add_argument("--dataset", type=str, default=None,
+                        help="HuggingFace LeRobotDataset repo id (e.g. lerobot/libero_10)")
+    parser.add_argument("--parquet", type=str, default=None,
+                        help="Path to parquet_thermal dataset dir (e.g. /scratch/libero_thermal/data/train). "
+                             "Uses ParquetThermalDataset instead of LeRobotDataset.")
     parser.add_argument("--image_key", type=str, default="observation.images.top",
-                        help="Dataset key to use as RGB input to 4M")
+                        help="Dataset key to use as RGB input to 4M (only for --dataset mode)")
 
     # Checkpoints
     parser.add_argument("--smolvla_checkpoint", type=str, default="lerobot/smolvla_libero")
@@ -70,6 +73,20 @@ def parse_args():
     parser.add_argument("--log_every", type=int, default=50)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--max_lang_tokens", type=int, default=48)
+
+    # Distillation mode
+    parser.add_argument("--distill", action="store_true",
+                        help="Use joint loss: L_action + lambda_distill * L_cosine(4M+MLP, SigLIP+connector). "
+                             "Correct target: full embed_image() path, inference normalization.")
+    parser.add_argument("--distill_only", action="store_true",
+                        help="Distillation loss only — no action loss. "
+                             "Only needs RGB images (parquet dataset works). "
+                             "Use this for stage 1 before joint training.")
+    parser.add_argument("--lambda_distill", type=float, default=0.1,
+                        help="Weight of distillation loss in joint training (default 0.1)")
+    parser.add_argument("--init_checkpoint", type=str, default=None,
+                        help="Initialize from an existing checkpoint before training "
+                             "(e.g. a previous stage1 run). Keys not found are ignored.")
 
     # Dummy mode — no dataset needed
     parser.add_argument("--dummy", action="store_true",
@@ -143,6 +160,48 @@ def make_dummy_batch(args, tokenizer, device):
     return inputs, batch
 
 
+def make_batch_parquet(sample, tokenizer, max_lang_tokens, device):
+    """Convert a ParquetThermalDataset sample into Block2 inputs + batch dict.
+
+    ParquetThermalDataset returns: {"rgb": (3,H,W), "depth": (1,H,W), "action": (7,), ...}
+    DataLoader batches these to (B, ...).
+    """
+    B = sample["rgb"].shape[0]
+    rgb   = sample["rgb"].to(device)      # (B, 3, H, W)  float [0,1]
+    depth = sample.get("depth", torch.zeros(B, 1, rgb.shape[-2], rgb.shape[-1])).to(device)
+
+    # Dummy state and action — parquet has no robot state or action labels
+    # Use zero state; actions come from the dataset if available, else zeros
+    state   = sample.get("state",  torch.zeros(B, 7, device=device))
+    actions = sample.get("action", torch.zeros(B, 50, 7, device=device))
+    if isinstance(state,   torch.Tensor): state   = state.to(device)
+    if isinstance(actions, torch.Tensor): actions = actions.to(device)
+    # Pad action chunk to 50 steps if needed
+    if actions.dim() == 2:                  # (B, action_dim)
+        actions = actions.unsqueeze(1).expand(-1, 50, -1)
+    elif actions.shape[1] < 50:
+        pad = torch.zeros(B, 50 - actions.shape[1], actions.shape[2], device=device)
+        actions = torch.cat([actions, pad], dim=1)
+
+    lang = ["pick and place the object"] * B   # placeholder — parquet has no lang labels
+    tokenized = tokenizer(lang, padding="max_length", truncation=True,
+                          max_length=max_lang_tokens, return_tensors="pt")
+
+    inputs = {
+        "rgb":     rgb,
+        "depth":   depth,
+        "seg":     torch.zeros(B, 1, rgb.shape[-2], rgb.shape[-1], device=device),
+        "thermal": torch.zeros(B, 1024, device=device),
+    }
+    batch = {
+        "observation.state":                   state,
+        "observation.language.tokens":         tokenized["input_ids"].to(device),
+        "observation.language.attention_mask": tokenized["attention_mask"].to(device),
+        "action": actions,
+    }
+    return inputs, batch
+
+
 def make_batch(sample, image_key, tokenizer, max_lang_tokens, device):
     """Convert a LeRobotDataset sample into Block2 inputs + batch dict."""
     rgb = sample[image_key].to(device)          # (B, 3, H, W)
@@ -201,9 +260,21 @@ def main():
     if args.dummy:
         log.info("Dummy mode: using random inputs (no dataset)")
         dataloader = None
-    else:
+    elif args.parquet is not None:
+        from utils.parquet_dataset import ParquetThermalDataset
+        log.info(f"Loading parquet dataset from {args.parquet}")
+        dataset = ParquetThermalDataset(args.parquet, chunk_size=1)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=True,
+        )
+        log.info(f"Parquet dataset: {len(dataset)} frames")
+    elif args.dataset is not None:
         from lerobot.datasets import LeRobotDataset
-        log.info(f"Loading dataset: {args.dataset}")
+        log.info(f"Loading HF dataset: {args.dataset}")
         dataset = LeRobotDataset(args.dataset)
         dataloader = DataLoader(
             dataset,
@@ -212,6 +283,8 @@ def main():
             num_workers=args.num_workers,
             pin_memory=True,
         )
+    else:
+        raise ValueError("Provide --dataset, --parquet, or --dummy")
 
     # Build config from CLI flags
     from src.pipeline.smolvla.configuration_smolvla import LocalSmolVLAConfig
@@ -226,52 +299,152 @@ def main():
     log.info(f"Config: freeze_4m={cfg.freeze_4m}, freeze_mlp={cfg.freeze_mlp}, "
              f"freeze_smolvlm={cfg.freeze_smolvlm}, freeze_action_expert={cfg.freeze_action_expert}")
 
-    # Build Block2 (freezing handled manually after load so all weights are initialized first)
-    from src.pipeline.block2 import Block2
-    log.info("Building Block2 ...")
-    block2 = Block2(
-        fourm_checkpoint=cfg.fourm_checkpoint,
-        smolvla_checkpoint=args.smolvla_checkpoint,
-        use_4m=cfg.use_4m,
-        freeze_4m=False,
-        freeze_mlp=False,
-        fourm_dim=cfg.fourm_dim,
-        device=device,
-    )
-    block2.train()
-
-    # Apply freeze flags from config
-    apply_freeze_flags(block2, cfg)
-
-    # Optimizer — only trainable params
-    optimizer = torch.optim.AdamW(
-        [p for p in block2.parameters() if p.requires_grad],
-        lr=args.lr,
-    )
-
     os.makedirs(args.output_dir, exist_ok=True)
-
     log.info("Starting training ...")
     step = 0
     running_loss = 0.0
 
-    def _train_step(inputs, batch):
-        nonlocal running_loss, step
-        loss_dict = block2.compute_loss(inputs, batch)
-        loss = loss_dict["loss"]
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        running_loss += loss.item()
-        step += 1
-        if step % args.log_every == 0:
-            avg = running_loss / args.log_every
-            log.info(f"step={step}/{args.steps}  loss={avg:.4f}")
-            running_loss = 0.0
-        if step % args.save_every == 0:
-            ckpt = os.path.join(args.output_dir, f"block2_step{step}.pt")
-            torch.save(block2.state_dict(), ckpt)
-            log.info(f"Saved checkpoint: {ckpt}")
+    if args.distill_only:
+        # Pure distillation — no action loss, no batch needed
+        from src.pipeline.full_pipeline import VLAPipeline
+        log.info("Building VLAPipeline for distillation-only training ...")
+        pipeline = VLAPipeline(
+            smolvla_checkpoint=args.smolvla_checkpoint,
+            fourm_checkpoint=cfg.fourm_checkpoint,
+            fourm_dim=cfg.fourm_dim,
+            use_4m=True, freeze_4m=False, freeze_mlp=False,
+            device=device, skip_block1=True,
+        )
+        pipeline.train()
+        block2 = pipeline.block2
+        apply_freeze_flags(block2, cfg)
+
+        if args.init_checkpoint is not None:
+            log.info(f"Loading init checkpoint: {args.init_checkpoint}")
+            state = torch.load(args.init_checkpoint, map_location="cpu", weights_only=False)
+            missing, unexpected = pipeline.load_state_dict(state, strict=False)
+            log.info(f"Init checkpoint loaded (missing={len(missing)}, unexpected={len(unexpected)})")
+
+        optimizer = torch.optim.AdamW(
+            [p for p in pipeline.parameters() if p.requires_grad], lr=args.lr)
+
+        def _train_step(inputs, batch):
+            nonlocal running_loss, step
+            loss_dict = pipeline.compute_distill_loss(inputs, epoch=0)
+            loss = loss_dict["loss"]
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+            step += 1
+            if step % args.log_every == 0:
+                avg  = running_loss / args.log_every
+                cos  = loss_dict.get("mean_cosine_similarity", 1 - avg)
+                n_sig = loss_dict.get("n_siglip_tokens", "?")
+                n_4m  = loss_dict.get("n_fourm_tokens",  "?")
+                sig_n = loss_dict.get("siglip_norm", float("nan"))
+                mlp_n = loss_dict.get("mlp_norm",    float("nan"))
+                log.info(f"step={step}/{args.steps}  distill={avg:.4f}  "
+                         f"cos_sim={cos:.4f}  "
+                         f"norm_sig={sig_n:.1f}  norm_mlp={mlp_n:.1f}  "
+                         f"tokens={n_sig}sig/{n_4m}4m")
+                running_loss = 0.0
+            if step % args.save_every == 0:
+                ckpt = os.path.join(args.output_dir, f"block2_step{step:06d}.pt")
+                torch.save(pipeline.state_dict(), ckpt)
+                log.info(f"Saved → {ckpt}")
+
+    elif args.distill:
+        # Joint mode: need VLAPipeline to access compute_joint_loss
+        from src.pipeline.full_pipeline import VLAPipeline
+        log.info("Building VLAPipeline (skip_block1=True) for joint distill+action training ...")
+        pipeline = VLAPipeline(
+            smolvla_checkpoint=args.smolvla_checkpoint,
+            fourm_checkpoint=cfg.fourm_checkpoint,
+            fourm_dim=cfg.fourm_dim,
+            use_4m=True,
+            freeze_4m=False,
+            freeze_mlp=False,
+            device=device,
+            skip_block1=True,
+        )
+        pipeline.train()
+        block2 = pipeline.block2
+        apply_freeze_flags(block2, cfg)
+
+        if args.init_checkpoint is not None:
+            log.info(f"Loading init checkpoint: {args.init_checkpoint}")
+            state = torch.load(args.init_checkpoint, map_location="cpu", weights_only=False)
+            missing, unexpected = pipeline.load_state_dict(state, strict=False)
+            log.info(f"Init checkpoint loaded (missing={len(missing)}, unexpected={len(unexpected)})")
+
+        optimizer = torch.optim.AdamW(
+            [p for p in pipeline.parameters() if p.requires_grad], lr=args.lr)
+
+        def _train_step(inputs, batch):
+            nonlocal running_loss, step
+            loss_dict = pipeline.compute_joint_loss(
+                inputs, batch, epoch=0, lambda_distill=args.lambda_distill)
+            loss = loss_dict["loss"]
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+            step += 1
+            if step % args.log_every == 0:
+                avg = running_loss / args.log_every
+                cos = loss_dict.get("distill_loss", 0.0)
+                act = loss_dict.get("action_loss", 0.0)
+                log.info(f"step={step}/{args.steps}  loss={avg:.4f}  "
+                         f"action={act:.4f}  distill={cos:.4f}")
+                running_loss = 0.0
+            if step % args.save_every == 0:
+                ckpt = os.path.join(args.output_dir, f"block2_step{step:06d}.pt")
+                torch.save(pipeline.state_dict(), ckpt)
+                log.info(f"Saved → {ckpt}")
+
+    else:
+        # Action-only mode (original behaviour)
+        from src.pipeline.block2 import Block2
+        log.info("Building Block2 (action loss only) ...")
+        block2 = Block2(
+            fourm_checkpoint=cfg.fourm_checkpoint,
+            smolvla_checkpoint=args.smolvla_checkpoint,
+            use_4m=True,
+            freeze_4m=False,
+            freeze_mlp=False,
+            fourm_dim=cfg.fourm_dim,
+            device=device,
+        )
+        block2.train()
+        apply_freeze_flags(block2, cfg)
+
+        if args.init_checkpoint is not None:
+            log.info(f"Loading init checkpoint: {args.init_checkpoint}")
+            state = torch.load(args.init_checkpoint, map_location="cpu", weights_only=False)
+            missing, unexpected = block2.load_state_dict(state, strict=False)
+            log.info(f"Init checkpoint loaded (missing={len(missing)}, unexpected={len(unexpected)})")
+
+        optimizer = torch.optim.AdamW(
+            [p for p in block2.parameters() if p.requires_grad], lr=args.lr)
+
+        def _train_step(inputs, batch):
+            nonlocal running_loss, step
+            loss_dict = block2.compute_loss(inputs, batch)
+            loss = loss_dict["loss"]
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+            step += 1
+            if step % args.log_every == 0:
+                avg = running_loss / args.log_every
+                log.info(f"step={step}/{args.steps}  loss={avg:.4f}")
+                running_loss = 0.0
+            if step % args.save_every == 0:
+                ckpt = os.path.join(args.output_dir, f"block2_step{step:06d}.pt")
+                torch.save(block2.state_dict(), ckpt)
+                log.info(f"Saved → {ckpt}")
 
     if args.dummy:
         while step < args.steps:
@@ -282,14 +455,18 @@ def main():
             for sample in dataloader:
                 if step >= args.steps:
                     break
-                inputs, batch = make_batch(
-                    sample, args.image_key, tokenizer, args.max_lang_tokens, device
-                )
+                if args.parquet is not None:
+                    inputs, batch = make_batch_parquet(
+                        sample, tokenizer, args.max_lang_tokens, device)
+                else:
+                    inputs, batch = make_batch(
+                        sample, args.image_key, tokenizer, args.max_lang_tokens, device)
                 _train_step(inputs, batch)
 
     # Final save
+    model_to_save = pipeline if (args.distill or args.distill_only) else block2
     ckpt = os.path.join(args.output_dir, "block2_final.pt")
-    torch.save(block2.state_dict(), ckpt)
+    torch.save(model_to_save.state_dict(), ckpt)
     log.info(f"Training done. Final checkpoint: {ckpt}")
 
 

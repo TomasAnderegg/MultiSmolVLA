@@ -106,11 +106,14 @@ class CustomSmolVLAPolicy(nn.Module):
             for p in vlm.fourm_encoder.model.parameters():
                 p.requires_grad = False
 
-        # MLP connector: use the actual output dim from the loaded encoder (768 for B, 1024 for L/XL)
+        # MLP connector: maps 4M tokens to SmolLM2 token space.
+        # n_out_tokens=64 matches SigLIP+connector output (8×8 after pixel-unshuffle in SmolVLM2-500M).
+        # Without this, SmolLM2 receives 196 tokens instead of 64, breaking all RoPE positions.
         target_dim = vlm.config.text_config.hidden_size
         vlm.fourm_to_vlm = MLPConnector(
             encoder_dim=vlm.fourm_encoder.output_dim,
             smolvla_dim=target_dim,
+            n_out_tokens=64,
         )
         if freeze_mlp:
             for p in vlm.fourm_to_vlm.parameters():

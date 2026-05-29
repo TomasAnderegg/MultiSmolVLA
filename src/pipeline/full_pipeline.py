@@ -69,6 +69,29 @@ class VLAPipeline(nn.Module):
         inputs = self._run_block1(inputs, epoch)
         return self.block2.compute_loss(inputs, batch)
 
+    def _siglip_features(self, rgb: torch.Tensor) -> torch.Tensor:
+        """SigLIP + connector features — the correct distillation target.
+
+        Replicates exactly what prepare_images + embed_image does at inference:
+          resize → (512,512), normalize [0,1]→[-1,1],
+          vision_model → connector → (B, N_siglip, 960)
+        """
+        vlm         = self.block2.smolvla.policy.base_policy.model.vlm_with_expert
+        resize_hw   = self.block2.smolvla.policy.config.resize_imgs_with_padding
+        vision_model = vlm.get_vlm_model().vision_model
+        connector    = vlm.get_vlm_model().connector
+
+        rgb_prep = F.interpolate(rgb, size=resize_hw, mode='bilinear', align_corners=False)
+        rgb_prep = rgb_prep * 2.0 - 1.0   # [0,1] → [-1,1] as SigLIP expects
+
+        with torch.no_grad():
+            hidden = vision_model(
+                pixel_values=rgb_prep.to(dtype=vision_model.dtype)
+            ).last_hidden_state
+            tokens = connector(hidden).float()   # (B, N_siglip, D_vlm)
+
+        return tokens
+
     def _get_siglip_proj(self, d_siglip: int, d_mlp: int, device) -> torch.nn.Linear:
         if not hasattr(self, "_siglip_proj") or self._siglip_proj.weight.shape != (d_mlp, d_siglip):
             self._siglip_proj = torch.nn.Linear(d_siglip, d_mlp, bias=False).to(device)
@@ -80,44 +103,43 @@ class VLAPipeline(nn.Module):
         return self._siglip_proj
 
     def compute_distill_loss(self, inputs: dict, epoch: int = 0) -> dict:
-        """Stage 1 distillation loss: per-token cosine alignment of 4M+MLP tokens with SigLIP.
+        """Stage 1 distillation: per-token cosine alignment of 4M+MLP vs SigLIP+connector.
 
-        Aligns each of the 196 spatial tokens individually (not just the mean-pooled global
-        representation). This forces per-patch directional alignment, which is what SmolVLA's
-        cross-attention actually needs.
+        Target = embed_image() output: SigLIP vision_model → SmolVLM connector → (B, N, 960).
+        Input normalization matches inference: resize (512,512), [-1,1].
+        Token count mismatch handled by linear interpolation.
         """
         inputs = self._run_block1(inputs, epoch)
-        rgb = inputs["rgb"]  # (B, 3, 224, 224)
+        rgb = inputs["rgb"]
 
-        vlm_with_expert = self.block2.smolvla.policy.base_policy.model.vlm_with_expert
+        vlm = self.block2.smolvla.policy.base_policy.model.vlm_with_expert
 
-        # ── SigLIP tokens (frozen) ────────────────────────────────────────────
-        vision_model = vlm_with_expert.get_vlm_model().vision_model
+        # Correct target: full SigLIP + connector path, inference normalization
+        siglip_tokens = self._siglip_features(rgb)     # (B, N_sig, D_vlm)
+
+        # 4M + MLP tokens
+        fourm_tokens = vlm.fourm_encoder(inputs)
+        mlp_tokens   = vlm.fourm_to_vlm(fourm_tokens).float()   # (B, N_4m, D_vlm)
+
+        B, N_4m, D = mlp_tokens.shape
+        _, N_sig, _ = siglip_tokens.shape
+
+        # Align token counts if different (linear interpolation over spatial dim)
+        if N_4m != N_sig:
+            siglip_tokens = F.interpolate(
+                siglip_tokens.permute(0, 2, 1),   # (B, D, N_sig)
+                size=N_4m, mode='linear', align_corners=False
+            ).permute(0, 2, 1)                    # (B, N_4m, D)
+
+        mlp_flat = F.normalize(mlp_tokens.reshape(B * N_4m, D), dim=-1)
+        sig_flat = F.normalize(siglip_tokens.reshape(B * N_4m, D), dim=-1)
+        target   = torch.ones(B * N_4m, device=rgb.device)
+        loss     = F.cosine_embedding_loss(mlp_flat, sig_flat, target)
+
         with torch.no_grad():
-            siglip_out = vision_model(pixel_values=rgb.to(dtype=vision_model.dtype))
-            siglip_tokens = siglip_out.last_hidden_state.float()  # (B, 196, 768)
-
-        # ── 4M + MLP tokens ───────────────────────────────────────────────────
-        fourm_tokens = vlm_with_expert.fourm_encoder(inputs)      # (B, 196, D_4m)
-        mlp_tokens   = vlm_with_expert.fourm_to_vlm(fourm_tokens).float()  # (B, 196, D_vlm)
-
-        B, N, D_mlp    = mlp_tokens.shape
-        _,  _, D_siglip = siglip_tokens.shape
-
-        # ── Project SigLIP 768 → D_vlm per token (frozen near-identity) ──────
-        proj = self._get_siglip_proj(D_siglip, D_mlp, rgb.device)
-        siglip_proj = proj(siglip_tokens)  # (B, 196, D_mlp)
-
-        # ── Per-token cosine loss ─────────────────────────────────────────────
-        mlp_flat  = F.normalize(mlp_tokens.reshape(B * N, D_mlp),   dim=-1)
-        sig_flat  = F.normalize(siglip_proj.reshape(B * N, D_mlp),  dim=-1)
-        target    = torch.ones(B * N, device=rgb.device)
-        loss      = F.cosine_embedding_loss(mlp_flat, sig_flat, target)
-
-        with torch.no_grad():
-            mean_cos  = (mlp_flat * sig_flat).sum(dim=-1).mean()
-            mlp_norm  = mlp_tokens.norm(dim=-1).mean()
-            sig_norm  = siglip_tokens.norm(dim=-1).mean()
+            mean_cos = (mlp_flat * sig_flat).sum(dim=-1).mean()
+            mlp_norm = mlp_tokens.norm(dim=-1).mean()
+            sig_norm = siglip_tokens.norm(dim=-1).mean()
 
         return {
             "loss":                   loss,
@@ -125,6 +147,8 @@ class VLAPipeline(nn.Module):
             "mean_cosine_similarity": mean_cos.item(),
             "mlp_norm":               mlp_norm.item(),
             "siglip_norm":            sig_norm.item(),
+            "n_siglip_tokens":        N_sig,
+            "n_fourm_tokens":         N_4m,
         }
 
     def compute_joint_loss(self, inputs: dict, batch: dict, epoch: int = 0,
@@ -145,24 +169,23 @@ class VLAPipeline(nn.Module):
         action_dict = self.block2.compute_loss(inputs, batch)
         action_loss = action_dict["loss"]
 
-        # ── Distillation loss (per-token) ─────────────────────────────────────
-        vlm_with_expert = self.block2.smolvla.policy.base_policy.model.vlm_with_expert
-        vision_model = vlm_with_expert.get_vlm_model().vision_model
-        with torch.no_grad():
-            siglip_out    = vision_model(pixel_values=rgb.to(dtype=vision_model.dtype))
-            siglip_tokens = siglip_out.last_hidden_state.float()  # (B, 196, 768)
+        # ── Distillation loss (per-token, correct target) ─────────────────────
+        vlm = self.block2.smolvla.policy.base_policy.model.vlm_with_expert
+        siglip_tokens = self._siglip_features(rgb)          # (B, N_sig, D_vlm)
+        fourm_tokens  = vlm.fourm_encoder(inputs)
+        mlp_tokens    = vlm.fourm_to_vlm(fourm_tokens).float()   # (B, N_4m, D_vlm)
 
-        fourm_tokens = vlm_with_expert.fourm_encoder(inputs)
-        mlp_tokens   = vlm_with_expert.fourm_to_vlm(fourm_tokens).float()  # (B, 196, D_vlm)
+        B, N_4m, D = mlp_tokens.shape
+        _, N_sig, _ = siglip_tokens.shape
+        if N_4m != N_sig:
+            siglip_tokens = F.interpolate(
+                siglip_tokens.permute(0, 2, 1),
+                size=N_4m, mode='linear', align_corners=False
+            ).permute(0, 2, 1)
 
-        B, N, D_mlp    = mlp_tokens.shape
-        _,  _, D_siglip = siglip_tokens.shape
-
-        proj         = self._get_siglip_proj(D_siglip, D_mlp, rgb.device)
-        siglip_proj  = proj(siglip_tokens)
-        mlp_flat     = F.normalize(mlp_tokens.reshape(B * N, D_mlp),  dim=-1)
-        sig_flat     = F.normalize(siglip_proj.reshape(B * N, D_mlp), dim=-1)
-        target       = torch.ones(B * N, device=rgb.device)
+        mlp_flat     = F.normalize(mlp_tokens.reshape(B * N_4m, D),     dim=-1)
+        sig_flat     = F.normalize(siglip_tokens.reshape(B * N_4m, D),  dim=-1)
+        target       = torch.ones(B * N_4m, device=rgb.device)
         distill_loss = F.cosine_embedding_loss(mlp_flat, sig_flat, target)
 
         total_loss = action_loss + lambda_distill * distill_loss
