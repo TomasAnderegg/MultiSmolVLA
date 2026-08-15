@@ -9,7 +9,7 @@ git clone --recurse-submodules <repo_url>
 ```
 
 ---
-
+c.f: https://mfblanco.github.io/MultiSmolVLA/
 ## Overview
 
 State-of-the-art Vision-Language-Action (VLA) models rely exclusively on RGB perception and suffer catastrophic performance degradation under sensor failure. We propose a training strategy that builds robustness by replacing SmolVLA's SigLIP encoder with the frozen **4M-21** multimodal encoder, bridged by a lightweight **MLP connector**, and trained under a **modality-dropout curriculum** to handle missing or corrupted sensors at inference time.
